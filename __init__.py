@@ -1,0 +1,1 @@
+'''this is a custom module created to train WGANs by me'''
