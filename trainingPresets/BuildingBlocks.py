@@ -217,7 +217,8 @@ class ConvBlock(nn.Module):
         norm_type: Union[str, NormType] = 'batch',
         activation: Union[str, ActivationType] = 'relu',
         dropout: float = 0.0,
-        spectral_norm: bool = False
+        spectral_norm: bool = False,
+        negative_slope:float = 0.2
     ):
         super().__init__()
         if padding is None:
@@ -228,7 +229,7 @@ class ConvBlock(nn.Module):
                          groups=groups, bias=bias)
         self.conv = apply_spectral_norm(conv, spectral_norm)
         self.norm = get_norm_layer(norm_type, out_channels)
-        self.activation = get_activation(activation)
+        self.activation = get_activation(activation,negative_slope = negative_slope)
         self.dropout = nn.Dropout2d(dropout) if dropout and dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -310,7 +311,8 @@ class ResidualBlock(nn.Module):
         dropout: float = 0.0,
         anti_alias: bool = False,
         spectral_norm: bool = False,
-        zero_init_residual: bool = False
+        zero_init_residual: bool = False,
+        negative_slope:float = 0.2
     ):
         super().__init__()
         mid_channels = out_channels
@@ -327,7 +329,8 @@ class ResidualBlock(nn.Module):
             bias=False,
             norm_type=norm_type,
             activation=activation,
-            spectral_norm=spectral_norm
+            spectral_norm=spectral_norm,
+            negative_slope=negative_slope
         )
 
         # conv2: produce out_channels
@@ -343,7 +346,8 @@ class ResidualBlock(nn.Module):
             norm_type=norm_type,
             activation='none',
             dropout=dropout,
-            spectral_norm=spectral_norm
+            spectral_norm=spectral_norm,
+            negative_slope=negative_slope
         )
 
         if attention == 'se':
@@ -416,7 +420,8 @@ class BottleneckBlock(nn.Module):
         attention: Optional[str] = None,
         dropout: float = 0.0,
         anti_alias: bool = False,
-        spectral_norm: bool = False
+        spectral_norm: bool = False,
+        negative_slope:float = 0.2
     ):
         super().__init__()
         mid = max(out_channels // expansion, 1)
@@ -454,7 +459,7 @@ class BottleneckBlock(nn.Module):
         else:
             self.downsample = nn.Identity()
 
-        self.final_activation = get_activation(activation)
+        self.final_activation = get_activation(activation, negative_slope = negative_slope)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = self.skip(x)
@@ -491,7 +496,8 @@ class UpsampleBlock(nn.Module):
         activation: Union[str, ActivationType] = 'relu',
         attention: Optional[str] = None,
         dropout: float = 0.0,
-        spectral_norm: bool = False
+        spectral_norm: bool = False,
+        negative_slope:float = 0.2
     ):
         super().__init__()
         self.scale_factor = scale_factor
@@ -516,7 +522,7 @@ class UpsampleBlock(nn.Module):
             raise ValueError(f"Unknown upsampling method: {method}")
 
         self.norm = get_norm_layer(norm_type, out_channels)
-        self.activation = get_activation(activation)
+        self.activation = get_activation(activation,negative_slope = negative_slope)
         self.refine = ConvBlock(out_channels, out_channels, 3, norm_type=norm_type, activation=activation, dropout=dropout, spectral_norm=spectral_norm)
 
         if attention == 'se':
@@ -569,14 +575,15 @@ class RecurrentBlock(nn.Module):
         norm_type: Union[str, NormType] = 'batch',
         activation: Union[str, ActivationType] = 'relu',
         gated: bool = True,
-        spectral_norm: bool = False
+        spectral_norm: bool = False,
+        negative_slope:float = 0.2
     ):
         super().__init__()
         self.steps = steps
         self.gated = gated
         self.conv = apply_spectral_norm(nn.Conv2d(channels, channels, 3, 1, 1, bias=False), spectral_norm)
         self.norm = get_norm_layer(norm_type, channels)
-        self.activation = get_activation(activation)
+        self.activation = get_activation(activation, negative_slope = negative_slope)
         if gated:
             self.gate_conv = apply_spectral_norm(nn.Conv2d(channels, channels, 3, 1, 1, bias=True), spectral_norm)
 
