@@ -157,10 +157,11 @@ class SpaceshipWGANGP:
                     batch_size = real_.size(0)
                     z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
                     fake_ = self.generator(z)
-                    
-                    # Use full critic loss with gradient penalty for consistency
-                    c_loss_val, _, _ = self.critic_loss(real_, fake_)
-                    g_loss_val = self.generator_loss(fake_)
+
+                    fake_scores = self.critic(fake_)
+                    real_scores = self.critic(real_)
+                    c_loss_test = fake_scores.mean() - real_scores.mean()
+                    g_loss_test = -fake_scores.mean()
                     
                     c_val_losses.append(c_loss_val.item())
                     g_val_losses.append(g_loss_val.item())
@@ -171,9 +172,10 @@ class SpaceshipWGANGP:
                     z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
                     fake_ = self.generator(z)
                     
-                    # Use full critic loss with gradient penalty for consistency
-                    c_loss_val, _, _ = self.critic_loss(real_, fake_)
-                    g_loss_val = self.generator_loss(fake_)
+                    fake_scores = self.critic(fake_)
+                    real_scores = self.critic(real_)
+                    c_loss_test = fake_scores.mean() - real_scores.mean()
+                    g_loss_test = -fake_scores.mean()
                     
                     c_val_losses.append(c_loss_val.item())
                     g_val_losses.append(g_loss_val.item())
@@ -315,7 +317,7 @@ class SpaceshipWGANGP:
                         current_g_loss = g_loss.item()
                         total_batches = len(self.train_dl)
                         progress_pct = (batch_idx / total_batches) * 100
-                        print('-'*60)
+                        print('-'*100)
                         print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
                               f'Critic loss: {avg_c_loss:.4f} || Gen loss: {current_g_loss:.4f} || '
                               f'Fake score: {avg_fake_score:.4f} || Real score: {avg_real_score:.4f}')
@@ -362,7 +364,7 @@ class SpaceshipWGANGP:
                         current_g_loss = g_loss.item()
                         total_batches = len(self.train_dl)
                         progress_pct = (batch_idx / total_batches) * 100
-                        print('-'*60)
+                        print('-'*100)
                         print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
                               f'Critic loss: {avg_c_loss:.4f} || Gen loss: {current_g_loss:.4f} || '
                               f'Fake score: {avg_fake_score:.4f} || Real score: {avg_real_score:.4f}')
