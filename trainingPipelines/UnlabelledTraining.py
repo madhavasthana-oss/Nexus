@@ -136,7 +136,7 @@ class SpaceshipWGANGP:
         real_scores = self.critic(real_)
         wasserstein_distance = fake_scores.mean() - real_scores.mean()
         gp = self.gradient_penalty(real_, fake_)
-        return wasserstein_distance + self.lambda_gp * gp
+        return wasserstein_distance + self.lambda_gp * gp, fake_scores, real_scores
 
     def generator_loss(self, fake_):
         """Calculate generator loss."""
@@ -145,58 +145,43 @@ class SpaceshipWGANGP:
     
     def validate_epoch(self):
         """Run validation for one epoch."""
-        if self.is_labelled:
-            
-            self.generator.eval()
-            self.critic.eval()
-            
-            c_val_losses, g_val_losses = [], []
-            
-            with torch.no_grad():
+        self.generator.eval()
+        self.critic.eval()
+        
+        c_val_losses, g_val_losses = [], []
+        
+        with torch.no_grad():
+            if self.is_labelled:
                 for imgs_, _ in self.val_dl:
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
                     z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
                     fake_ = self.generator(z)
                     
-                    # Note: For validation, we might skip gradient penalty for speed
-                    # Or include it for consistency - here we include it
-                    c_loss_val = self.critic(fake_).mean() - self.critic(real_).mean()
+                    # Use full critic loss with gradient penalty for consistency
+                    c_loss_val, _, _ = self.critic_loss(real_, fake_)
                     g_loss_val = self.generator_loss(fake_)
                     
                     c_val_losses.append(c_loss_val.item())
                     g_val_losses.append(g_loss_val.item())
-            
-            self.generator.train()
-            self.critic.train()
-            
-            return c_val_losses, g_val_losses
-
-        else:
-            self.generator.eval()
-            self.critic.eval()
-            
-            c_val_losses, g_val_losses = [], []
-            
-            with torch.no_grad():
+            else:
                 for imgs_ in self.val_dl:
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
                     z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
                     fake_ = self.generator(z)
                     
-                    # Note: For validation, we might skip gradient penalty for speed
-                    # Or include it for consistency - here we include it
-                    c_loss_val = self.critic(fake_).mean() - self.critic(real_).mean()
+                    # Use full critic loss with gradient penalty for consistency
+                    c_loss_val, _, _ = self.critic_loss(real_, fake_)
                     g_loss_val = self.generator_loss(fake_)
                     
                     c_val_losses.append(c_loss_val.item())
                     g_val_losses.append(g_loss_val.item())
-            
-            self.generator.train()
-            self.critic.train()
-            
-            return c_val_losses, g_val_losses
+        
+        self.generator.train()
+        self.critic.train()
+        
+        return c_val_losses, g_val_losses
 
     def plot_losses(self, history, kind="training"):
         """Plot generator and critic losses."""
@@ -283,30 +268,33 @@ class SpaceshipWGANGP:
         best_g_val_loss = float("inf")
         history = {}     
         
-        if self.is_labelled:
+        for epoch in range(self.num_epochs):
+            print("-"*100)
+            print(f'\t\t\t\t\t\tEPOCH {epoch}\t\t\t\t\t')
+            print("-"*100)
 
-            for epoch in range(self.num_epochs):
-                print("-"*100)
-                print(f'\t\t\t\t\t\tEPOCH {epoch}\t\t\t\t\t')
-                print("-"*100)
-
-                running_c_loss = []
-                running_g_loss = []
-                
+            running_c_loss = []
+            running_g_loss = []
+            
+            if self.is_labelled:
                 for batch_idx, (imgs_, _) in enumerate(self.train_dl):
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
 
                     # Train critic n_critic times
                     batch_c_losses = []
+                    batch_fake_scores = []
+                    batch_real_scores = []
                     for _ in range(n_critic):
                         self.c_opt.zero_grad()
                         z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
                         fake_ = self.generator(z).detach()  # Detach to avoid generator updates
-                        c_loss = self.critic_loss(real_, fake_)
+                        c_loss, fake_scores, real_scores = self.critic_loss(real_, fake_)
                         c_loss.backward()
                         self.c_opt.step()
                         batch_c_losses.append(c_loss.item())
+                        batch_fake_scores.append(fake_scores.mean().item())
+                        batch_real_scores.append(real_scores.mean().item())
 
                     running_c_loss.extend(batch_c_losses)
 
@@ -322,117 +310,38 @@ class SpaceshipWGANGP:
                     # Display progress based on display_per_batch setting
                     if display_per_batch > 0 and batch_idx % display_per_batch == 0:
                         avg_c_loss = np.mean(batch_c_losses)
+                        avg_fake_score = np.mean(batch_fake_scores)
+                        avg_real_score = np.mean(batch_real_scores)
                         current_g_loss = g_loss.item()
                         total_batches = len(self.train_dl)
                         progress_pct = (batch_idx / total_batches) * 100
                         print('-'*60)
                         print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
-                            f'Critic loss: {avg_c_loss:.4f} || Gen loss: {current_g_loss:.4f}')
+                              f'Critic loss: {avg_c_loss:.4f} || Gen loss: {current_g_loss:.4f} || '
+                              f'Fake score: {avg_fake_score:.4f} || Real score: {avg_real_score:.4f}')
                     
                     # Clear cache periodically
                     if batch_idx % 50 == 0 and self.device == 'cuda':
                         torch.cuda.empty_cache()
-        
-                # Validation
-                c_val_losses, g_val_losses = [], []
-                if epoch % validate_per_epoch == 0:
-                    c_val_losses, g_val_losses = self.validate_epoch()
-
-                # Compute epoch means
-                train_c_mean = np.mean(running_c_loss)
-                train_g_mean = np.mean(running_g_loss)
-                val_c_mean = np.mean(c_val_losses) if c_val_losses else None
-                val_g_mean = np.mean(g_val_losses) if g_val_losses else None
-
-                # Store history
-                history[f"epoch_{epoch}"] = {
-                    "generator losses": {"training": running_g_loss, "validating": g_val_losses},
-                    "critic losses": {"training": running_c_loss, "validating": c_val_losses}
-                }
-
-                # Logging
-                log_dict = {
-                    "epoch": epoch,
-                    "critic_loss/train_mean": train_c_mean,
-                    "generator_loss/train_mean": train_g_mean
-                }
-                
-                if val_g_mean is not None:
-                    # Early stopping logic
-                    if val_g_mean + min_delta < best_g_val_loss:
-                        best_g_val_loss = val_g_mean
-                        patience_counter = 0
-                        print("-"*100)
-                        print("<------------------- Validation improved! Resetting patience counter ------------------->")
-                        print("-"*100)
-                        
-                        # Save best model
-                        g_name = f'{gen_save_name}_epoch_{epoch}.pth'
-                        c_name = f'{critic_save_name}_epoch_{epoch}.pth'
-                        self.save_weights('model_weights', g_name, c_name)
-                    else:
-                        patience_counter += 1
-                        print("-"*100) 
-                        print(f"No improvement. Patience: {patience_counter}/{patience}")
-                        if patience_counter >= patience:
-                            print("Early stopping triggered.")
-                            break
-                    
-                    # Generate sample images
-                    self.plot_imgs(epoch, num_pictures, num_rows, out_dir)
-
-                    # Add validation metrics to log
-                    log_dict.update({
-                        "critic_loss/val_mean": val_c_mean,
-                        "generator_loss/val_mean": val_g_mean
-                    })
-                    
-                    if wandb is not None:
-                        log_dict.update({
-                            "critic_loss/train_hist": wandb.Histogram(running_c_loss),
-                            "generator_loss/train_hist": wandb.Histogram(running_g_loss),
-                            "critic_loss/val_hist": wandb.Histogram(c_val_losses),
-                            "generator_loss/val_hist": wandb.Histogram(g_val_losses)
-                        })
-
-                if wandb is not None:
-                    wandb.log(log_dict)
-            
-            # Plot final results
-            self.plot_losses(history, 'training')
-            if any('validating' in hist['generator losses'] and hist['generator losses']['validating'] 
-                for hist in history.values()):
-                self.plot_losses(history, 'validating')
-            
-            if wandb is not None:
-                wandb.finish()
-            
-            return history
-        
-        else:
-
-            for epoch in range(self.num_epochs):
-                print("-"*100)
-                print(f'\t\t\t\t\t\tEPOCH {epoch}\t\t\t\t\t')
-                print("-"*100)
-
-                running_c_loss = []
-                running_g_loss = []
-                
+            else:
                 for batch_idx, imgs_ in enumerate(self.train_dl):
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
 
                     # Train critic n_critic times
                     batch_c_losses = []
+                    batch_fake_scores = []
+                    batch_real_scores = []
                     for _ in range(n_critic):
                         self.c_opt.zero_grad()
                         z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
                         fake_ = self.generator(z).detach()  # Detach to avoid generator updates
-                        c_loss = self.critic_loss(real_, fake_)
+                        c_loss, fake_scores, real_scores = self.critic_loss(real_, fake_)
                         c_loss.backward()
                         self.c_opt.step()
                         batch_c_losses.append(c_loss.item())
+                        batch_fake_scores.append(fake_scores.mean().item())
+                        batch_real_scores.append(real_scores.mean().item())
 
                     running_c_loss.extend(batch_c_losses)
 
@@ -448,92 +357,95 @@ class SpaceshipWGANGP:
                     # Display progress based on display_per_batch setting
                     if display_per_batch > 0 and batch_idx % display_per_batch == 0:
                         avg_c_loss = np.mean(batch_c_losses)
+                        avg_fake_score = np.mean(batch_fake_scores)
+                        avg_real_score = np.mean(batch_real_scores)
                         current_g_loss = g_loss.item()
                         total_batches = len(self.train_dl)
                         progress_pct = (batch_idx / total_batches) * 100
                         print('-'*60)
                         print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
-                            f'Critic loss: {avg_c_loss:.4f} || Gen loss: {current_g_loss:.4f}')
+                              f'Critic loss: {avg_c_loss:.4f} || Gen loss: {current_g_loss:.4f} || '
+                              f'Fake score: {avg_fake_score:.4f} || Real score: {avg_real_score:.4f}')
                     
                     # Clear cache periodically
                     if batch_idx % 50 == 0 and self.device == 'cuda':
                         torch.cuda.empty_cache()
-        
-                # Validation
-                c_val_losses, g_val_losses = [], []
-                if epoch % validate_per_epoch == 0:
-                    c_val_losses, g_val_losses = self.validate_epoch()
+    
+            # Validation
+            c_val_losses, g_val_losses = [], []
+            if epoch % validate_per_epoch == 0:
+                c_val_losses, g_val_losses = self.validate_epoch()
 
-                # Compute epoch means
-                train_c_mean = np.mean(running_c_loss)
-                train_g_mean = np.mean(running_g_loss)
-                val_c_mean = np.mean(c_val_losses) if c_val_losses else None
-                val_g_mean = np.mean(g_val_losses) if g_val_losses else None
+            # Compute epoch means
+            train_c_mean = np.mean(running_c_loss)
+            train_g_mean = np.mean(running_g_loss)
+            val_c_mean = np.mean(c_val_losses) if c_val_losses else None
+            val_g_mean = np.mean(g_val_losses) if g_val_losses else None
 
-                # Store history
-                history[f"epoch_{epoch}"] = {
-                    "generator losses": {"training": running_g_loss, "validating": g_val_losses},
-                    "critic losses": {"training": running_c_loss, "validating": c_val_losses}
-                }
+            # Store history
+            history[f"epoch_{epoch}"] = {
+                "generator losses": {"training": running_g_loss, "validating": g_val_losses},
+                "critic losses": {"training": running_c_loss, "validating": c_val_losses}
+            }
 
-                # Logging
-                log_dict = {
-                    "epoch": epoch,
-                    "critic_loss/train_mean": train_c_mean,
-                    "generator_loss/train_mean": train_g_mean
-                }
+            # Logging
+            log_dict = {
+                "epoch": epoch,
+                "critic_loss/train_mean": train_c_mean,
+                "generator_loss/train_mean": train_g_mean
+            }
+            
+            if val_g_mean is not None:
+                # Early stopping logic
+                if val_g_mean + min_delta < best_g_val_loss:
+                    best_g_val_loss = val_g_mean
+                    patience_counter = 0
+                    print("-"*100)
+                    print("<------------------- Validation improved! Resetting patience counter ------------------->")
+                    print("-"*100)
+                    
+                    # Save best model
+                    g_name = f'{gen_save_name}_epoch_{epoch}.pth'
+                    c_name = f'{critic_save_name}_epoch_{epoch}.pth'
+                    self.save_weights('model_weights', g_name, c_name)
+                else:
+                    patience_counter += 1
+                    print("-"*100) 
+                    print(f"No improvement. Patience: {patience_counter}/{patience}")
+                    if patience_counter >= patience:
+                        print("Early stopping triggered.")
+                        break
                 
-                if val_g_mean is not None:
-                    # Early stopping logic
-                    if val_g_mean + min_delta < best_g_val_loss:
-                        best_g_val_loss = val_g_mean
-                        patience_counter = 0
-                        print("-"*100)
-                        print("<------------------- Validation improved! Resetting patience counter ------------------->")
-                        print("-"*100)
-                        
-                        # Save best model
-                        g_name = f'{gen_save_name}_epoch_{epoch}.pth'
-                        c_name = f'{critic_save_name}_epoch_{epoch}.pth'
-                        self.save_weights('model_weights', g_name, c_name)
-                    else:
-                        patience_counter += 1
-                        print("-"*100) 
-                        print(f"No improvement. Patience: {patience_counter}/{patience}")
-                        if patience_counter >= patience:
-                            print("Early stopping triggered.")
-                            break
-                    
-                    # Generate sample images
-                    self.plot_imgs(epoch, num_pictures, num_rows, out_dir)
+                # Generate sample images
+                self.plot_imgs(epoch, num_pictures, num_rows, out_dir)
 
-                    # Add validation metrics to log
-                    log_dict.update({
-                        "critic_loss/val_mean": val_c_mean,
-                        "generator_loss/val_mean": val_g_mean
-                    })
-                    
-                    if wandb is not None:
-                        log_dict.update({
-                            "critic_loss/train_hist": wandb.Histogram(running_c_loss),
-                            "generator_loss/train_hist": wandb.Histogram(running_g_loss),
-                            "critic_loss/val_hist": wandb.Histogram(c_val_losses),
-                            "generator_loss/val_hist": wandb.Histogram(g_val_losses)
-                        })
-
+                # Add validation metrics to log
+                log_dict.update({
+                    "critic_loss/val_mean": val_c_mean,
+                    "generator_loss/val_mean": val_g_mean
+                })
+                
                 if wandb is not None:
-                    wandb.log(log_dict)
-            
-            # Plot final results
-            self.plot_losses(history, 'training')
-            if any('validating' in hist['generator losses'] and hist['generator losses']['validating'] 
-                for hist in history.values()):
-                self.plot_losses(history, 'validating')
-            
+                    log_dict.update({
+                        "critic_loss/train_hist": wandb.Histogram(running_c_loss),
+                        "generator_loss/train_hist": wandb.Histogram(running_g_loss),
+                        "critic_loss/val_hist": wandb.Histogram(c_val_losses),
+                        "generator_loss/val_hist": wandb.Histogram(g_val_losses)
+                    })
+
             if wandb is not None:
-                wandb.finish()
-            
-            return history
+                wandb.log(log_dict)
+        
+        # Plot final results
+        self.plot_losses(history, 'training')
+        if any('validating' in hist['generator losses'] and hist['generator losses']['validating'] 
+            for hist in history.values()):
+            self.plot_losses(history, 'validating')
+        
+        if wandb is not None:
+            wandb.finish()
+        
+        return history
 
     def test(self):
         """Evaluate model on test set."""
@@ -543,9 +455,8 @@ class SpaceshipWGANGP:
         c_test_losses = []
         g_test_losses = []
         
-        if self.is_labelled:
-                
-            with torch.no_grad():
+        with torch.no_grad():
+            if self.is_labelled:
                 for imgs_, _ in self.val_dl:
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
@@ -560,15 +471,7 @@ class SpaceshipWGANGP:
 
                     c_test_losses.append(c_loss_test.item())
                     g_test_losses.append(g_loss_test.item())
-
-            test_results = pd.DataFrame([
-                {'Model': 'Generator', 'Test Loss (Average)': np.mean(g_test_losses)},
-                {'Model': 'Critic', 'Test Loss (Average)': np.mean(c_test_losses)}
-            ])
-            
-            return test_results
-        else:
-            with torch.no_grad():
+            else:
                 for imgs_ in self.val_dl:
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
@@ -584,12 +487,12 @@ class SpaceshipWGANGP:
                     c_test_losses.append(c_loss_test.item())
                     g_test_losses.append(g_loss_test.item())
 
-            test_results = pd.DataFrame([
-                {'Model': 'Generator', 'Test Loss (Average)': np.mean(g_test_losses)},
-                {'Model': 'Critic', 'Test Loss (Average)': np.mean(c_test_losses)}
-            ])
-            
-            return test_results
+        test_results = pd.DataFrame([
+            {'Model': 'Generator', 'Test Loss (Average)': np.mean(g_test_losses)},
+            {'Model': 'Critic', 'Test Loss (Average)': np.mean(c_test_losses)}
+        ])
+        
+        return test_results
 
     def save_weights(self, weight_dir='model_weights', generator_name='generator.pth', critic_name='critic.pth'):
         """Save model weights."""
