@@ -238,7 +238,8 @@ class SpaceshipWGANGP:
         project_name="wgan-gp-run",
         num_pictures=16,
         num_rows=4, 
-        out_dir='generated_pics'
+        gen_out_dir='generated_pics',
+        model_out_dir = 'model_weights'
     ):
         """
         Main training loop with validation and early stopping.
@@ -409,7 +410,7 @@ class SpaceshipWGANGP:
                     # Save best model
                     g_name = f'{gen_save_name}_epoch_{epoch}.pth'
                     c_name = f'{critic_save_name}_epoch_{epoch}.pth'
-                    self.save_weights('model_weights', g_name, c_name)
+                    self.save_weights(model_out_dir, g_name, c_name)
                 else:
                     patience_counter += 1
                     print("-"*100) 
