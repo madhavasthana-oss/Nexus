@@ -421,7 +421,7 @@ class SpaceshipWGANGP:
                         break
                 
                 # Generate sample images
-                self.plot_imgs(epoch, num_pictures, num_rows, out_dir = gen_out_dir)
+                self.plot_imgs(epoch, num_pictures, num_rows, gen_out_dir = gen_out_dir)
 
                 # Add validation metrics to log
                 log_dict.update({
