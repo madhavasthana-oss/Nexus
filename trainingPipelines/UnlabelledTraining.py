@@ -160,8 +160,8 @@ class SpaceshipWGANGP:
 
                     fake_scores = self.critic(fake_)
                     real_scores = self.critic(real_)
-                    c_loss_test = fake_scores.mean() - real_scores.mean()
-                    g_loss_test = -fake_scores.mean()
+                    c_loss_val = fake_scores.mean() - real_scores.mean()
+                    g_loss_val = -fake_scores.mean()
                     
                     c_val_losses.append(c_loss_val.item())
                     g_val_losses.append(g_loss_val.item())
@@ -174,8 +174,8 @@ class SpaceshipWGANGP:
                     
                     fake_scores = self.critic(fake_)
                     real_scores = self.critic(real_)
-                    c_loss_test = fake_scores.mean() - real_scores.mean()
-                    g_loss_test = -fake_scores.mean()
+                    c_loss_val = fake_scores.mean() - real_scores.mean()
+                    g_loss_val = -fake_scores.mean()
                     
                     c_val_losses.append(c_loss_val.item())
                     g_val_losses.append(g_loss_val.item())
