@@ -55,10 +55,10 @@ class SpaceshipWGANGP:
         self.g_opt, self.c_opt = self.get_optimizers()
         self.train_dl, self.val_dl = self.get_dataloaders()
 
-    def plot_imgs(self, epoch, num_pictures=16, num_rows=4, out_dir='generated_pics'):
+    def plot_imgs(self, epoch, num_pictures=16, num_rows=4, gen_out_dir='generated_pics'):
         """Generate and save sample images."""
         try:
-            os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(gen_out_dir, exist_ok=True)
             self.generator.eval()
             
             with torch.no_grad():
@@ -69,7 +69,7 @@ class SpaceshipWGANGP:
             img_grids = torchvision.utils.make_grid(fake_, nrow=num_rows)
             torchvision.utils.save_image(
                 img_grids, 
-                os.path.join(out_dir, f'generated_imgs_epoch_{epoch}.png')
+                os.path.join(gen_out_dir, f'generated_imgs_epoch_{epoch}.png')
             )
             self.generator.train()
         except Exception as e:
@@ -255,7 +255,8 @@ class SpaceshipWGANGP:
             project_name: Wandb project name
             num_pictures: Number of sample images to generate
             num_rows: Number of rows in sample image grid
-            out_dir: Output directory for generated images
+            gen_out_dir: Output directory for generated images
+            model_out_dir: Output directory for model weights
         """
         
         try:
@@ -420,7 +421,7 @@ class SpaceshipWGANGP:
                         break
                 
                 # Generate sample images
-                self.plot_imgs(epoch, num_pictures, num_rows, out_dir)
+                self.plot_imgs(epoch, num_pictures, num_rows, out_dir = gen_out_dir)
 
                 # Add validation metrics to log
                 log_dict.update({
