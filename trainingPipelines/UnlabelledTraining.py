@@ -20,6 +20,7 @@ class SpaceshipWGANGP:
         is_labelled:bool = True,
         num_epochs: int = 50,
         batch_size: int = 32,
+        noise_dim = (1,1),
         transform=None,
         lr: float = 5e-5,
         g_betas=(0.0, 0.9),
@@ -54,6 +55,7 @@ class SpaceshipWGANGP:
         
         self.g_opt, self.c_opt = self.get_optimizers()
         self.train_dl, self.val_dl = self.get_dataloaders()
+        self.noise_dim = noise_dim
 
     def plot_imgs(self, epoch, num_pictures=16, num_rows=4, gen_out_dir='generated_pics'):
         """Generate and save sample images."""
@@ -62,7 +64,7 @@ class SpaceshipWGANGP:
             self.generator.eval()
             
             with torch.no_grad():
-                z = torch.randn(num_pictures, self.latent_dim, 1, 1, device=self.device)
+                z = torch.randn(num_pictures, self.latent_dim, *self.noise_dim , device=self.device)
                 fake_ = self.generator(z).cpu()
                 fake_ = (fake_ + 1) / 2  # Normalize to [0,1]
                 
@@ -155,7 +157,7 @@ class SpaceshipWGANGP:
                 for imgs_, _ in self.val_dl:
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
-                    z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+                    z = torch.randn(batch_size, self.latent_dim, *self.noise_dim, device=self.device)
                     fake_ = self.generator(z)
 
                     fake_scores = self.critic(fake_)
@@ -169,7 +171,7 @@ class SpaceshipWGANGP:
                 for imgs_ in self.val_dl:
                     real_ = imgs_.to(self.device)
                     batch_size = real_.size(0)
-                    z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+                    z = torch.randn(batch_size, self.latent_dim, *self.noise_dim, device=self.device)
                     fake_ = self.generator(z)
                     
                     fake_scores = self.critic(fake_)
@@ -291,7 +293,7 @@ class SpaceshipWGANGP:
                     batch_real_scores = []
                     for _ in range(n_critic):
                         self.c_opt.zero_grad()
-                        z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+                        z = torch.randn(batch_size, self.latent_dim, *self.noise_dim, device=self.device)
                         fake_ = self.generator(z).detach()  # Detach to avoid generator updates
                         c_loss, fake_scores, real_scores = self.critic_loss(real_, fake_)
                         c_loss.backward()
@@ -304,7 +306,7 @@ class SpaceshipWGANGP:
 
                     # Train generator once
                     self.g_opt.zero_grad()
-                    z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+                    z = torch.randn(batch_size, self.latent_dim, *self.noise_dim, device=self.device)
                     fake_ = self.generator(z)
                     g_loss = self.generator_loss(fake_)
                     g_loss.backward()
@@ -338,7 +340,7 @@ class SpaceshipWGANGP:
                     batch_real_scores = []
                     for _ in range(n_critic):
                         self.c_opt.zero_grad()
-                        z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+                        z = torch.randn(batch_size, self.latent_dim, *self.noise_dim, device=self.device)
                         fake_ = self.generator(z).detach()  # Detach to avoid generator updates
                         c_loss, fake_scores, real_scores = self.critic_loss(real_, fake_)
                         c_loss.backward()
@@ -351,7 +353,7 @@ class SpaceshipWGANGP:
 
                     # Train generator once
                     self.g_opt.zero_grad()
-                    z = torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+                    z = torch.randn(batch_size, self.latent_dim, *self.noise_dim, device=self.device)
                     fake_ = self.generator(z)
                     g_loss = self.generator_loss(fake_)
                     g_loss.backward()
@@ -421,7 +423,7 @@ class SpaceshipWGANGP:
                         break
                 
                 # Generate sample images
-                self.plot_imgs(epoch, num_pictures, num_rows, out_dir = gen_out_dir)
+                self.plot_imgs(epoch, num_pictures, num_rows, gen_out_dir = gen_out_dir)
 
                 # Add validation metrics to log
                 log_dict.update({
