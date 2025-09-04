@@ -15,7 +15,8 @@ import torch.nn as nn
 import torchvision
 from torch import optim
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import wandb
 
@@ -42,7 +43,7 @@ class TrainingConfig:
     img_shape: Tuple[int, ...] = (1, 28, 28)
     
     # Dataset handling
-    split_factor: float = 0.8
+    ratios: Tuple[float, ...] = (0.8, 0.1, 0.1)
     is_labelled: bool = True
     num_workers: int = 4
     pin_memory: bool = True
@@ -96,8 +97,8 @@ class TrainingConfig:
             raise ValueError("learning rates must be positive")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if not 0 < self.split_factor < 1:
-            raise ValueError("split_factor must be between 0 and 1")
+        if len(self.ratios) > 3 or len(self.ratios) < 2:
+            raise ValueError("ratios must be be a proper tuple")
         if self.lambda_gp < 0:
             raise ValueError("lambda_gp must be non-negative")
         if self.n_critic <= 0:
@@ -188,7 +189,7 @@ class SpaceshipWGANGP:
         self.scaler = GradScaler() if config.mixed_precision and self.device.type == 'cuda' else None
         
         # Data loaders
-        self.train_dl, self.val_dl = self._create_dataloaders()
+        self.train_dl, self.val_dl, self.test_dl= self._create_dataloaders()
         
         # Training state
         self.current_epoch = 0
@@ -260,16 +261,26 @@ class SpaceshipWGANGP:
         
         return g_scheduler, c_scheduler
 
-    def _create_dataloaders(self):
-        """Create train and validation dataloaders."""
+    def _create_dataloaders(self) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
+        """Create train, validation, and optionally test dataloaders."""
         dataset_size = len(self.dataset)
-        train_size = int(self.config.split_factor * dataset_size)
-        val_size = dataset_size - train_size
+        ratios = self.config.ratios
         
-        train_ds, val_ds = random_split(self.dataset, [train_size, val_size])
+        if len(ratios) == 2:
+            train_size = int(ratios[0] * dataset_size)
+            val_size = dataset_size - train_size
+            splits = [train_size, val_size]
+        else:  # len(ratios) == 3
+            train_size = int(ratios[0] * dataset_size)
+            val_size = int(ratios[1] * dataset_size)
+            test_size = dataset_size - train_size - val_size
+            splits = [train_size, val_size, test_size]
         
-        train_dl = DataLoader(
-            train_ds,
+        datasets = random_split(self.dataset, splits)
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            datasets[0],
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=self.config.num_workers,
@@ -277,8 +288,8 @@ class SpaceshipWGANGP:
             persistent_workers=self.config.num_workers > 0
         )
         
-        val_dl = DataLoader(
-            val_ds,
+        val_loader = DataLoader(
+            datasets[1],
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=self.config.num_workers,
@@ -286,8 +297,20 @@ class SpaceshipWGANGP:
             persistent_workers=self.config.num_workers > 0
         )
         
-        return train_dl, val_dl
+        test_loader = None
 
+        if len(datasets) == 3:
+            test_loader = DataLoader(
+                datasets[2],
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                num_workers=self.config.num_workers,
+                pin_memory=self.config.pin_memory and self.device.type == 'cuda',
+                persistent_workers=self.config.num_workers > 0
+            )
+        
+        return train_loader, val_loader, test_loader
+    
     def _sample_noise(self, batch_size: int) -> torch.Tensor:
         """Generate random noise for generator input."""
         return torch.randn(
@@ -394,7 +417,7 @@ class SpaceshipWGANGP:
                     fake_imgs = self.generator(z)
                 
                 # Critic loss with mixed precision
-                with autocast(enabled=self.scaler is not None):
+                with autocast('cuda', enabled=self.scaler is not None):
                     c_loss, fake_scores, real_scores, gp = self.critic_loss(real_imgs, fake_imgs)
                 
                 # Backward pass for critic
@@ -430,7 +453,7 @@ class SpaceshipWGANGP:
             fake_imgs = self.generator(z)
             
             # Generator loss with mixed precision
-            with autocast(enabled=self.scaler is not None):
+            with autocast('cuda', enabled=self.scaler is not None):
                 g_loss = self.generator_loss(fake_imgs)
             
             # Backward pass for generator
@@ -470,6 +493,7 @@ class SpaceshipWGANGP:
                 print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
                       f'G Loss: {g_loss.item():.4f} || C Loss: {avg_c_loss:.4f} || '
                       f'Fake: {avg_fake_score:.4f} || Real: {avg_real_score:.4f} || GP: {avg_gp:.4f}')
+                print('-'*120)
             
             # Optional cache clearing
             if (self.config.clear_cache_every_n_batches > 0 and 
@@ -759,7 +783,7 @@ class SpaceshipWGANGP:
         plt.show()
         plt.close()
 
-    def train_validate(self):
+    def fit(self):
         """
         Main training loop with validation, early stopping, and comprehensive logging.
         
