@@ -18,7 +18,7 @@ import torchvision
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torch import amp
-from torch.amp import autocast, GradScaler
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import wandb
 
@@ -222,6 +222,77 @@ class MetricsTracker:
         return classification_report(self.targets, self.predictions)
 
 
+class CWGANGPMetricsTracker:
+    """Track and compute WGAN-GP specific metrics during training."""
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        """Reset all tracked metrics."""
+        self.g_losses = []
+        self.c_losses = []
+        self.fake_scores = []
+        self.real_scores = []
+        self.gp_values = []
+        self.batch_count = 0
+    
+    def update(self, g_loss: float, c_loss: float, fake_score: float, real_score: float, gp: Optional[float] = None):
+        """
+        Update metrics with new batch data.
+        
+        Args:
+            g_loss: Generator loss value
+            c_loss: Critic loss value  
+            fake_score: Mean critic score for fake images
+            real_score: Mean critic score for real images
+            gp: Gradient penalty value (optional, for training only)
+        """
+        self.g_losses.append(g_loss)
+        self.c_losses.append(c_loss)
+        self.fake_scores.append(fake_score)
+        self.real_scores.append(real_score)
+        if gp is not None:
+            self.gp_values.append(gp)
+        self.batch_count += 1
+    
+    def compute_means(self) -> Dict[str, float]:
+        """Compute mean values for all tracked metrics."""
+        if self.batch_count == 0:
+            return {}
+        
+        metrics = {
+            'g_loss_mean': np.mean(self.g_losses),
+            'c_loss_mean': np.mean(self.c_losses),
+            'fake_score_mean': np.mean(self.fake_scores),
+            'real_score_mean': np.mean(self.real_scores),
+            'wasserstein_distance': np.mean(self.fake_scores) - np.mean(self.real_scores),
+            'batch_count': self.batch_count
+        }
+        
+        if self.gp_values:
+            metrics['gp_mean'] = np.mean(self.gp_values)
+        
+        return metrics
+    
+    def get_latest_values(self) -> Dict[str, float]:
+        """Get the most recent metric values."""
+        if self.batch_count == 0:
+            return {}
+        
+        latest = {
+            'g_loss_latest': self.g_losses[-1] if self.g_losses else 0.0,
+            'c_loss_latest': self.c_losses[-1] if self.c_losses else 0.0,
+            'fake_score_latest': self.fake_scores[-1] if self.fake_scores else 0.0,
+            'real_score_latest': self.real_scores[-1] if self.real_scores else 0.0,
+        }
+        
+        if self.gp_values:
+            latest['gp_latest'] = self.gp_values[-1]
+            
+        return latest
+
+
 class BaseTrainer(ABC):
     """Abstract base trainer class."""
     
@@ -281,8 +352,8 @@ class SpaceshipClassifier(BaseTrainer):
         self.train_metrics = MetricsTracker()
         self.val_metrics = MetricsTracker()
         
-        print(f"✅ Initialized SpaceshipClassifier on {self.device}")
-        print(f"📊 Dataset splits: {len(self.train_loader.dataset)}/{len(self.val_loader.dataset)}" + 
+        print(f"Initialized SpaceshipClassifier on {self.device}")
+        print(f"Dataset splits: {len(self.train_loader.dataset)}/{len(self.val_loader.dataset)}" + 
               (f"/{len(self.test_loader.dataset)}" if self.test_loader else ""))
     
     def _setup_directories(self):
@@ -506,7 +577,7 @@ class SpaceshipClassifier(BaseTrainer):
         if is_best:
             best_path = filepath.replace('.pth', '_best.pth')
             torch.save(checkpoint, best_path)
-            print(f"💾 Best model saved: {best_path}")
+            print(f"Best model saved: {best_path}")
     
     def load_checkpoint(self, filepath: str) -> Dict:
         """Load model checkpoint."""
@@ -528,12 +599,12 @@ class SpaceshipClassifier(BaseTrainer):
         self.best_val_loss = checkpoint['best_val_loss']
         self.history = checkpoint.get('history', {'train': [], 'val': [], 'test': []})
         
-        print(f"📂 Checkpoint loaded: {filepath} (epoch {self.current_epoch})")
+        print(f"Checkpoint loaded: {filepath} (epoch {self.current_epoch})")
         return checkpoint
     
     def fit(self) -> Dict:
         """Main training loop with all the bells and whistles."""
-        print("🚀 Starting training...")
+        print("Starting training...")
         
         # Initialize wandb
         if self.config.wandb_project:
@@ -543,9 +614,9 @@ class SpaceshipClassifier(BaseTrainer):
                     config=self.config.__dict__,
                     reinit=True
                 )
-                print("📊 W&B initialized successfully")
+                print("W&B initialized successfully")
             except Exception as e:
-                print(f"⚠️  W&B initialization failed: {e}")
+                print(f"W&B initialization failed: {e}")
                 wandb = None
         
         start_time = time.time()
@@ -556,7 +627,7 @@ class SpaceshipClassifier(BaseTrainer):
                 epoch_start = time.time()
                 
                 print(f"\n{'='*80}")
-                print(f"\t\t\t\t🌟 EPOCH {epoch+1}/{self.config.num_epochs}")
+                print(f"\t\t\tEPOCH {epoch+1}/{self.config.num_epochs}")
                 print(f"{'='*80}")
                 
                 # Training
@@ -575,13 +646,13 @@ class SpaceshipClassifier(BaseTrainer):
                 epoch_time = time.time() - epoch_start
                 lr = self.optimizer.param_groups[0]['lr']
                 
-                print(f"⏱️  Epoch time: {epoch_time:.2f}s | LR: {lr:.2e}")
-                print(f"🔥 Train - Loss: {train_metrics.get('loss', 0):.4f} | "
+                print(f"Epoch time: {epoch_time:.2f}s | LR: {lr:.2e}")
+                print(f"Train - Loss: {train_metrics.get('loss', 0):.4f} | "
                       f"Acc: {train_metrics.get('accuracy', 0):.2f}% | "
                       f"F1: {train_metrics.get('f1_score', 0):.3f}")
                 
                 if val_metrics:
-                    print(f"✅ Val   - Loss: {val_metrics.get('loss', 0):.4f} | "
+                    print(f"Val   - Loss: {val_metrics.get('loss', 0):.4f} | "
                           f"Acc: {val_metrics.get('accuracy', 0):.2f}% | "
                           f"F1: {val_metrics.get('f1_score', 0):.3f}")
                 
@@ -596,9 +667,9 @@ class SpaceshipClassifier(BaseTrainer):
                     self.save_checkpoint(str(checkpoint_path))
                 
                 if should_save:
-                    print("🎯 New best model!")
+                    print("New best model!")
                 else:
-                    print(f"⏳ Patience: {self.patience_counter}/{self.config.patience}")
+                    print(f"Patience: {self.patience_counter}/{self.config.patience}")
                 
                 # Update scheduler
                 self._update_scheduler(val_metrics)
@@ -616,19 +687,19 @@ class SpaceshipClassifier(BaseTrainer):
                 
                 # Early stopping
                 if self.patience_counter >= self.config.patience:
-                    print(f"\n🛑 Early stopping triggered! No improvement for {self.config.patience} epochs")
+                    print(f"\nEarly stopping triggered! No improvement for {self.config.patience} epochs")
                     break
         
         except KeyboardInterrupt:
-            print("\n⚠️  Training interrupted by user")
+            print("\nTraining interrupted by user")
         
         except Exception as e:
-            print(f"\n❌ Training failed: {e}")
+            print(f"\nTraining failed: {e}")
             raise
         
         finally:
             total_time = time.time() - start_time
-            print(f"\n🏁 Training completed in {total_time/60:.2f} minutes")
+            print(f"\nTraining completed in {total_time/60:.2f} minutes")
             
             if wandb is not None:
                 wandb.finish()
@@ -638,14 +709,14 @@ class SpaceshipClassifier(BaseTrainer):
     def test(self) -> Optional[Dict[str, float]]:
         """Evaluate on test set with detailed metrics."""
         if not self.test_loader:
-            print("❌ No test set available")
+            print("No test set available")
             return None
         
-        print("🧪 Running test evaluation...")
+        print("Running test evaluation...")
         test_metrics = self.validate_epoch("test")
         
         if test_metrics:
-            print(f"\n📊 TEST RESULTS:")
+            print(f"\nTEST RESULTS:")
             print(f"Loss: {test_metrics['loss']:.4f}")
             print(f"Accuracy: {test_metrics['accuracy']:.2f}%")
             print(f"Precision: {test_metrics['precision']:.3f}")
@@ -663,7 +734,7 @@ class SpaceshipClassifier(BaseTrainer):
                     preds = torch.argmax(logits, dim=1)
                     test_tracker.update(preds, y, 0)  # Loss not needed here
             
-            print(f"\n📈 Classification Report:")
+            print(f"\nClassification Report:")
             print(test_tracker.get_classification_report())
         
         return test_metrics
@@ -671,7 +742,7 @@ class SpaceshipClassifier(BaseTrainer):
     def plot_training_history(self, save_path: Optional[str] = None):
         """Create comprehensive training plots."""
         if not self.history['train']:
-            print("❌ No training history to plot")
+            print("No training history to plot")
             return
         
         # Prepare data
@@ -683,7 +754,7 @@ class SpaceshipClassifier(BaseTrainer):
         fig.suptitle('Training History', fontsize=16, fontweight='bold')
         
         # Loss plot
-        axes[0, 0].plot(epochs, [m.get('loss', 0) for m in train_data], 'b-', label='Train', linewidth=2)
+                    axes[0, 0].plot(epochs, [m.get('loss', 0) for m in train_data], 'b-', label='Train', linewidth=2)
         if val_data and any(val_data):
             val_epochs = [i+1 for i, m in enumerate(val_data) if m]
             val_losses = [m.get('loss', 0) for m in val_data if m]
@@ -700,670 +771,6 @@ class SpaceshipClassifier(BaseTrainer):
             val_accs = [m.get('accuracy', 0) for m in val_data if m]
             axes[0, 1].plot(val_epochs, val_accs, 'r-', label='Validation', linewidth=2)
         axes[0, 1].set_title('Accuracy')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Accuracy (%)')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # F1 Score plot
-        axes[1, 0].plot(epochs, [m.get('f1_score', 0) for m in train_data], 'b-', label='Train', linewidth=2)
-        if val_data and any(val_data):
-            val_f1s = [m.get('f1_score', 0) for m in val_data if m]
-            axes[1, 0].plot(val_epochs, val_f1s, 'r-', label='Validation', linewidth=2)
-        axes[1, 0].set_title('F1 Score')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('F1 Score')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Learning rate plot (if available)
-        if hasattr(self, 'lr_history') and self.lr_history:
-            axes[1, 1].plot(epochs, self.lr_history, 'g-', linewidth=2)
-            axes[1, 1].set_title('Learning Rate')
-            axes[1, 1].set_xlabel('Epoch')
-            axes[1, 1].set_ylabel('Learning Rate')
-            axes[1, 1].set_yscale('log')
-        else:
-            axes[1, 1].text(0.5, 0.5, 'Learning Rate\nHistory\nNot Available', 
-                           ha='center', va='center', transform=axes[1, 1].transAxes,
-                           fontsize=12, alpha=0.5)
-            axes[1, 1].set_title('Learning Rate')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"📊 Plot saved: {save_path}")
-        
-        plt.show()
-
-'''
-this is a pipelines to train CWGAN-GP
-the only difference in the critic and generator in this workflow is that 
-both the generator and the critic take in labels as well.
-
-the main idea is that 
-    ->generator 
-        =>input--(noise vector, label) -> image
-    ->critic
-        =>has to predict the image along with the labels
-            so input--(imgs, label) -> currency (1 or 0)
-        
-'''
-class SpaceshipCWGANGP:
-    """
-    Enhanced Conditional WGAN-GP implementation with modern training practices.
-    
-    Features:
-    - Clean configuration system with TrainingConfig_CWGANGP
-    - Mixed precision training for faster performance
-    - Advanced learning rate scheduling for both G and C
-    - Comprehensive metrics tracking and logging
-    - Flexible checkpoint saving/loading
-    - Better error handling and validation
-    - W&B integration with rich logging
-    - Automatic conditional image generation and saving
-    """
-
-    def __init__(self, generator, critic, dataset, config: TrainingConfig_CWGANGP):
-        """
-        Initialize the C-WGAN-GP trainer.
-        
-        Args:
-            generator: Conditional generator model
-            critic: Conditional critic (discriminator) model  
-            dataset: Full dataset to be split
-            config: C-WGAN-GP training configuration
-        """
-        self.config = config
-        self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
-        
-        # Models
-        self.generator = generator.to(self.device)
-        self.critic = critic.to(self.device)
-        self.dataset = dataset
-        
-        # Get number of classes from dataset
-        self.num_classes = self._get_num_classes()
-        
-        # Initialize training components
-        self._setup_directories()
-        self.g_optimizer, self.c_optimizer = self._configure_optimizers()
-        self.g_scheduler, self.c_scheduler = self._configure_schedulers()
-        self.scaler = GradScaler('cuda') if config.mixed_precision and self.device.type == 'cuda' else None
-        
-        # Data loaders
-        self.train_dl, self.val_dl, self.test_dl = self._create_dataloaders()
-        
-        # Training state
-        self.current_epoch = 0
-        self.best_g_val_loss = float('inf')
-        self.patience_counter = 0
-        self.history = {}
-        
-        # Metrics trackers (using proper GAN metrics tracker)
-        self.train_metrics = MetricsTracker()
-        self.val_metrics = MetricsTracker()
-        
-        print(f"SpaceshipCWGANGP initialized on {self.device}")
-        print(f"Dataset splits: Train={len(self.train_dl.dataset)}, Val={len(self.val_dl.dataset)}")
-        print(f"Number of classes: {self.num_classes}")
-        print(f"Generator LR: {config.g_lr}, Critic LR: {config.c_lr}")
-        print(f"Mixed Precision: {config.mixed_precision}, Lambda GP: {config.lambda_gp}")
-
-    def _get_num_classes(self):
-        """Extract number of classes from dataset."""
-        # Try to get from a sample
-        try:
-            sample = self.dataset[0]
-            if isinstance(sample, tuple) and len(sample) == 2:
-                # Labeled dataset
-                return len(set([self.dataset[i][1] for i in range(min(100, len(self.dataset)))]))
-            else:
-                # If no labels, default to 10 for KMNIST
-                return 10
-        except:
-            return 10
-
-    def _setup_directories(self):
-        """Create necessary directories."""
-        for dir_name in [self.config.model_dir, self.config.logs_dir, 
-                        self.config.plots_dir, self.config.gen_out_dir]:
-            Path(dir_name).mkdir(parents=True, exist_ok=True)
-
-    def _configure_optimizers(self):
-        """Configure optimizers for generator and critic."""
-        g_optimizer = optim.Adam(
-            self.generator.parameters(),
-            lr=self.config.g_lr,
-            betas=self.config.g_betas
-        )
-        
-        c_optimizer = optim.Adam(
-            self.critic.parameters(),
-            lr=self.config.c_lr,
-            betas=self.config.c_betas
-        )
-        
-        return g_optimizer, c_optimizer
-
-    def _configure_schedulers(self):
-        """Configure learning rate schedulers for both models."""
-        def create_scheduler(optimizer, scheduler_type):
-            if scheduler_type == "none":
-                return None
-            elif scheduler_type == "reduce_on_plateau":
-                return ReduceLROnPlateau(
-                    optimizer,
-                    mode='min',
-                    factor=self.config.scheduler_factor,
-                    patience=self.config.scheduler_patience,
-                    min_lr=self.config.scheduler_min_lr,
-                    verbose=True
-                )
-            elif scheduler_type == "cosine":
-                return CosineAnnealingLR(
-                    optimizer,
-                    T_max=self.config.scheduler_t_max,
-                    eta_min=self.config.scheduler_eta_min
-                )
-            elif scheduler_type == "step":
-                return StepLR(
-                    optimizer,
-                    step_size=self.config.scheduler_step_size,
-                    gamma=self.config.scheduler_gamma
-                )
-            return None
-
-        g_scheduler = create_scheduler(self.g_optimizer, self.config.g_scheduler_type)
-        c_scheduler = create_scheduler(self.c_optimizer, self.config.c_scheduler_type)
-        
-        return g_scheduler, c_scheduler
-
-    def _create_dataloaders(self) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
-        """Create train, validation, and optionally test dataloaders."""
-        dataset_size = len(self.dataset)
-        ratios = self.config.ratios
-        
-        if len(ratios) == 2:
-            train_size = int(ratios[0] * dataset_size)
-            val_size = dataset_size - train_size
-            splits = [train_size, val_size]
-        else:  # len(ratios) == 3
-            train_size = int(ratios[0] * dataset_size)
-            val_size = int(ratios[1] * dataset_size)
-            test_size = dataset_size - train_size - val_size
-            splits = [train_size, val_size, test_size]
-        
-        datasets = random_split(self.dataset, splits)
-        
-        # Create data loaders
-        train_loader = DataLoader(
-            datasets[0],
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory and self.device.type == 'cuda',
-            persistent_workers=self.config.num_workers > 0
-        )
-        
-        val_loader = DataLoader(
-            datasets[1],
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory and self.device.type == 'cuda',
-            persistent_workers=self.config.num_workers > 0
-        )
-        
-        test_loader = None
-        if len(datasets) == 3:
-            test_loader = DataLoader(
-                datasets[2],
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                num_workers=self.config.num_workers,
-                pin_memory=self.config.pin_memory and self.device.type == 'cuda',
-                persistent_workers=self.config.num_workers > 0
-            )
-        
-        return train_loader, val_loader, test_loader
-
-    def _sample_noise(self, batch_size: int) -> torch.Tensor:
-        """Generate random noise for generator input."""
-        return torch.randn(
-            batch_size, 
-            self.config.latent_dim, 
-            *self.config.noise_dim, 
-            device=self.device
-        )
-
-    def _sample_labels(self, batch_size: int) -> torch.Tensor:
-        """Generate random labels for conditional generation."""
-        return torch.randint(0, self.num_classes, (batch_size,), device=self.device)
-
-    def _critic_to_scalar(self, critic_out: torch.Tensor) -> torch.Tensor:
-        """
-        Ensure critic output is a per-sample scalar tensor of shape (B,).
-        Handles both scalar outputs and patch-based discriminators.
-        """
-        if critic_out.dim() == 1:
-            return critic_out
-        # Reduce spatial dimensions if they exist
-        return critic_out.view(critic_out.size(0), -1).mean(dim=1)
-
-    def gradient_penalty(self, labels: torch.Tensor, real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> torch.Tensor:
-        """Compute gradient penalty for C-WGAN-GP."""
-        batch_size = real_imgs.size(0)
-        
-        # Random interpolation factor
-        alpha = torch.rand(batch_size, *([1] * (real_imgs.dim() - 1)), device=self.device)
-        
-        # Interpolated images
-        interpolated = (alpha * real_imgs + (1 - alpha) * fake_imgs).requires_grad_(True)
-        
-        # Critic output for interpolated images with labels
-        c_interpolated = self.critic(interpolated, labels)
-        c_interpolated = self._critic_to_scalar(c_interpolated)
-        
-        # Compute gradients
-        grad_outputs = torch.ones_like(c_interpolated, device=self.device)
-        gradients = torch.autograd.grad(
-            outputs=c_interpolated,
-            inputs=interpolated,
-            grad_outputs=grad_outputs,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        
-        # Gradient penalty
-        gradients = gradients.view(batch_size, -1)
-        grad_norm = gradients.norm(2, dim=1)
-        gp = ((grad_norm - 1.0) ** 2).mean()
-        
-        return gp
-
-    def critic_loss(self, labels: torch.Tensor, real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute critic loss with gradient penalty."""
-        # Critic outputs with labels
-        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
-        real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
-        
-        # Wasserstein distance
-        wasserstein_distance = fake_scores.mean() - real_scores.mean()
-        
-        # Gradient penalty
-        gp = self.gradient_penalty(labels, real_imgs, fake_imgs)
-        
-        # Total critic loss
-        c_loss = wasserstein_distance + self.config.lambda_gp * gp
-        
-        return c_loss, fake_scores, real_scores, gp
-
-    def generator_loss(self, labels: torch.Tensor, fake_imgs: torch.Tensor) -> torch.Tensor:
-        """Compute generator loss."""
-        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
-        return -fake_scores.mean()
-
-    def train_epoch(self) -> Dict[str, float]:
-        """Run one training epoch."""
-        self.generator.train()
-        self.critic.train()
-        self.train_metrics.reset()
-        
-        total_batches = len(self.train_dl)
-        
-        for batch_idx, (real_imgs, labels) in enumerate(self.train_dl):
-            real_imgs = real_imgs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-            batch_size = real_imgs.size(0)
-            
-            # Train Critic n_critic times
-            batch_c_losses = []
-            batch_fake_scores = []
-            batch_real_scores = []
-            batch_gps = []
-            
-            for _ in range(self.config.n_critic):
-                self.c_optimizer.zero_grad()
-                
-                # Generate fake images with labels
-                z = self._sample_noise(batch_size)
-                with torch.no_grad():
-                    fake_imgs = self.generator(z, labels)
-                
-                # Critic loss with mixed precision
-                with autocast('cuda', enabled=self.scaler is not None):
-                    c_loss, fake_scores, real_scores, gp = self.critic_loss(labels, real_imgs, fake_imgs)
-                
-                # Backward pass for critic
-                if self.scaler:
-                    self.scaler.scale(c_loss).backward()
-                    if self.config.gradient_clip_norm:
-                        self.scaler.unscale_(self.c_optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.critic.parameters(), 
-                            self.config.gradient_clip_norm
-                        )
-                    self.scaler.step(self.c_optimizer)
-                    self.scaler.update()
-                else:
-                    c_loss.backward()
-                    if self.config.gradient_clip_norm:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.critic.parameters(), 
-                            self.config.gradient_clip_norm
-                        )
-                    self.c_optimizer.step()
-                
-                # Track critic metrics
-                batch_c_losses.append(c_loss.item())
-                batch_fake_scores.append(fake_scores.mean().item())
-                batch_real_scores.append(real_scores.mean().item())
-                batch_gps.append(gp.item())
-            
-            # Train Generator once
-            self.g_optimizer.zero_grad()
-            
-            z = self._sample_noise(batch_size)
-            fake_imgs = self.generator(z, labels)
-            
-            # Generator loss with mixed precision
-            with autocast('cuda', enabled=self.scaler is not None):
-                g_loss = self.generator_loss(labels, fake_imgs)
-            
-            # Backward pass for generator
-            if self.scaler:
-                self.scaler.scale(g_loss).backward()
-                if self.config.gradient_clip_norm:
-                    self.scaler.unscale_(self.g_optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.generator.parameters(), 
-                        self.config.gradient_clip_norm
-                    )
-                self.scaler.step(self.g_optimizer)
-                self.scaler.update()
-            else:
-                g_loss.backward()
-                if self.config.gradient_clip_norm:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.generator.parameters(), 
-                        self.config.gradient_clip_norm
-                    )
-                self.g_optimizer.step()
-            
-            # Update training metrics
-            avg_c_loss = np.mean(batch_c_losses)
-            avg_fake_score = np.mean(batch_fake_scores)
-            avg_real_score = np.mean(batch_real_scores)
-            avg_gp = np.mean(batch_gps)
-            
-            self.train_metrics.update(
-                g_loss.item(), avg_c_loss, avg_fake_score, avg_real_score, avg_gp
-            )
-            
-            # Progress logging
-            if (self.config.display_per_batch > 0 and 
-                batch_idx % self.config.display_per_batch == 0):
-                progress_pct = (batch_idx / total_batches) * 100
-                print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
-                      f'G Loss: {g_loss.item():.4f} || C Loss: {avg_c_loss:.4f} || '
-                      f'Fake: {avg_fake_score:.4f} || Real: {avg_real_score:.4f} || GP: {avg_gp:.4f}')
-                print('-'*120)
-            
-            # Optional cache clearing
-            if (self.config.clear_cache_every_n_batches > 0 and 
-                batch_idx % self.config.clear_cache_every_n_batches == 0 and 
-                self.device.type == 'cuda'):
-                torch.cuda.empty_cache()
-        
-        return self.train_metrics.compute_means()
-
-    def validate_epoch(self) -> Dict[str, float]:
-        """Run validation epoch."""
-        self.generator.eval()
-        self.critic.eval()
-        self.val_metrics.reset()
-        
-        with torch.no_grad():
-            for real_imgs, labels in self.val_dl:
-                real_imgs = real_imgs.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
-                batch_size = real_imgs.size(0)
-                
-                # Generate fake images with labels
-                z = self._sample_noise(batch_size)
-                fake_imgs = self.generator(z, labels)
-                
-                # Compute losses (no gradient penalty in validation)
-                fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
-                real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
-                
-                c_loss = fake_scores.mean() - real_scores.mean()
-                g_loss = -fake_scores.mean()
-                
-                self.val_metrics.update(
-                    g_loss.item(), c_loss.item(), 
-                    fake_scores.mean().item(), real_scores.mean().item()
-                )
-        
-        return self.val_metrics.compute_means()
-
-    def generate_images(self, epoch: int):
-        """Generate and save sample images for all classes."""
-        try:
-            self.generator.eval()
-            with torch.no_grad():
-                # Generate images for each class
-                images_per_class = max(1, self.config.num_pictures // self.num_classes)
-                total_images = images_per_class * self.num_classes
-                
-                z = self._sample_noise(total_images)
-                
-                # Create labels (equal number per class)
-                labels = []
-                for class_idx in range(self.num_classes):
-                    labels.extend([class_idx] * images_per_class)
-                labels = torch.tensor(labels[:total_images], device=self.device)
-                
-                fake_imgs = self.generator(z, labels).cpu()
-                # Normalize to [0, 1]
-                fake_imgs = (fake_imgs + 1) / 2.0
-                fake_imgs = torch.clamp(fake_imgs, 0, 1)
-            
-            # Create grid and save
-            img_grid = torchvision.utils.make_grid(fake_imgs, nrow=self.config.num_rows)
-            save_path = Path(self.config.gen_out_dir) / f'generated_epoch_{epoch}.png'
-            torchvision.utils.save_image(img_grid, save_path)
-            
-            self.generator.train()
-            print(f"Images saved: {save_path}")
-            
-        except Exception as e:
-            print(f"Error generating images: {e}")
-
-    def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint with comprehensive state."""
-        try:
-            checkpoint = {
-                'epoch': epoch,
-                'generator_state_dict': self.generator.state_dict(),
-                'critic_state_dict': self.critic.state_dict(),
-                'g_optimizer_state_dict': self.g_optimizer.state_dict(),
-                'c_optimizer_state_dict': self.c_optimizer.state_dict(),
-                'g_scheduler_state_dict': self.g_scheduler.state_dict() if self.g_scheduler else None,
-                'c_scheduler_state_dict': self.c_scheduler.state_dict() if self.c_scheduler else None,
-                'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-                'best_g_val_loss': self.best_g_val_loss,
-                'config': self.config,
-                'history': self.history,
-                'num_classes': self.num_classes,
-            }
-            
-            # Save regular checkpoint
-            checkpoint_path = Path(self.config.model_dir) / f"checkpoint_epoch_{epoch}.pth"
-            torch.save(checkpoint, checkpoint_path)
-            
-            # Save best model
-            if is_best:
-                best_path = Path(self.config.model_dir) / "best_checkpoint.pth"
-                torch.save(checkpoint, best_path)
-                print(f"Best checkpoint saved: {best_path}")
-            
-            print(f"Checkpoint saved: {checkpoint_path}")
-            
-        except Exception as e:
-            print(f"Error saving checkpoint: {e}")
-
-    def load_checkpoint(self, checkpoint_path: str) -> Dict:
-        """Load model checkpoint."""
-        try:
-            if not Path(checkpoint_path).exists():
-                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-            
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # Load model states
-            self.generator.load_state_dict(checkpoint['generator_state_dict'])
-            self.critic.load_state_dict(checkpoint['critic_state_dict'])
-            self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
-            self.c_optimizer.load_state_dict(checkpoint['c_optimizer_state_dict'])
-            
-            # Load scheduler states if they exist
-            if self.g_scheduler and checkpoint.get('g_scheduler_state_dict'):
-                self.g_scheduler.load_state_dict(checkpoint['g_scheduler_state_dict'])
-            if self.c_scheduler and checkpoint.get('c_scheduler_state_dict'):
-                self.c_scheduler.load_state_dict(checkpoint['c_scheduler_state_dict'])
-            
-            # Load scaler state if it exists
-            if self.scaler and checkpoint.get('scaler_state_dict'):
-                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            
-            # Load training state
-            self.current_epoch = checkpoint['epoch']
-            self.best_g_val_loss = checkpoint.get('best_g_val_loss', float('inf'))
-            self.history = checkpoint.get('history', {})
-            self.num_classes = checkpoint.get('num_classes', self.num_classes)
-            
-            print(f"Checkpoint loaded: {checkpoint_path} (epoch {self.current_epoch})")
-            return checkpoint
-            
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            raise
-
-    # Legacy methods for backward compatibility
-    def save_weights(self, weight_dir=None, generator_name=None, critic_name=None):
-        """Save model weights (legacy method)."""
-        weight_dir = weight_dir or self.config.model_dir
-        generator_name = generator_name or f"{self.config.gen_save_name}.pth"
-        critic_name = critic_name or f"{self.config.critic_save_name}.pth"
-        
-        try:
-            os.makedirs(weight_dir, exist_ok=True)
-            torch.save(self.generator.state_dict(), os.path.join(weight_dir, generator_name))
-            torch.save(self.critic.state_dict(), os.path.join(weight_dir, critic_name))
-            print(f"Models saved to {weight_dir}")
-        except Exception as e:
-            print(f"Error saving weights: {e}")
-
-    def load_weights(self, weight_dir=None, generator_name=None, critic_name=None):
-        """Load model weights (legacy method)."""
-        weight_dir = weight_dir or self.config.model_dir
-        generator_name = generator_name or f"{self.config.gen_save_name}.pth"
-        critic_name = critic_name or f"{self.config.critic_save_name}.pth"
-        
-        try:
-            gen_path = os.path.join(weight_dir, generator_name)
-            critic_path = os.path.join(weight_dir, critic_name)
-            
-            if os.path.exists(gen_path):
-                self.generator.load_state_dict(torch.load(gen_path, map_location=self.device))
-                print(f"Generator loaded from {gen_path}")
-            
-            if os.path.exists(critic_path):
-                self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
-                print(f"Critic loaded from {critic_path}")
-                
-        except Exception as e:
-            print(f"Error loading weights: {e}")
-
-    def save_optimizers(self, opt_dir="optimizers"):
-        """Save optimizer states (legacy method)."""
-        try:
-            os.makedirs(opt_dir, exist_ok=True)
-            torch.save(self.g_optimizer.state_dict(), os.path.join(opt_dir, 'g_optimizer.pth'))
-            torch.save(self.c_optimizer.state_dict(), os.path.join(opt_dir, 'c_optimizer.pth'))
-            print(f"Optimizers saved to {opt_dir}")
-        except Exception as e:
-            print(f"Error saving optimizers: {e}")
-
-    def load_optimizers(self, opt_dir="optimizers"):
-        """Load optimizer states (legacy method)."""
-        try:
-            g_path = os.path.join(opt_dir, 'g_optimizer.pth')
-            c_path = os.path.join(opt_dir, 'c_optimizer.pth')
-            
-            if os.path.exists(g_path):
-                self.g_optimizer.load_state_dict(torch.load(g_path, map_location=self.device))
-                print(f"Generator optimizer loaded from {g_path}")
-            if os.path.exists(c_path):
-                self.c_optimizer.load_state_dict(torch.load(c_path, map_location=self.device))
-                print(f"Critic optimizer loaded from {c_path}")
-                
-        except Exception as e:
-            print(f"Error loading optimizers: {e}")
-
-    def plot_losses(self, history: Dict, kind: str = "training"):
-        """Plot training curves with enhanced visualization."""
-        if not history:
-            print("No history to plot")
-            return
-
-        g_losses, c_losses, wasserstein_distances = [], [], []
-        fake_scores, real_scores, gp_values = [], [], []
-        epochs = []
-
-        for epoch_key, values in history.items():
-            if kind not in values:
-                continue
-            
-            metrics = values[kind]
-            if not metrics:
-                continue
-
-            epoch_num = int(epoch_key.split("_")[-1])
-            epochs.append(epoch_num)
-            
-            g_losses.append(metrics.get('g_loss_mean', 0))
-            c_losses.append(metrics.get('c_loss_mean', 0))
-            wasserstein_distances.append(metrics.get('wasserstein_distance', 0))
-            fake_scores.append(metrics.get('fake_score_mean', 0))
-            real_scores.append(metrics.get('real_score_mean', 0))
-            gp_values.append(metrics.get('gp_mean', 0))
-
-        if not g_losses:
-            print(f"No {kind} data to plot")
-            return
-
-        # Create comprehensive plot
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle(f'C-WGAN-GP {kind.capitalize()} Metrics', fontsize=16, fontweight='bold')
-
-        # Generator and Critic Losses
-        axes[0, 0].plot(epochs, g_losses, 'b-', label='Generator', linewidth=2, marker='o')
-        axes[0, 0].plot(epochs, c_losses, 'r-', label='Critic', linewidth=2, marker='s')
-        axes[0, 0].set_title('Generator vs Critic Loss')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-
-        # Wasserstein Distance
-        axes[0, 1].plot(epochs, wasserstein_distances, 'g-', linewidth=2, marker='o')
-        axes[0, 1].set_title('Wasserstein Distance')
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('Distance')
         axes[0, 1].grid(True, alpha=0.3)
@@ -1402,7 +809,7 @@ class SpaceshipCWGANGP:
         plt.tight_layout()
         
         # Save plot
-        plot_path = Path(self.config.plots_dir) / f"cwgan_gp_{kind}_metrics.png"
+        plot_path = Path(self.config.plots_dir) / f"wgan_gp_{kind}_metrics.png"
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         print(f"Plot saved: {plot_path}")
         
@@ -1416,7 +823,7 @@ class SpaceshipCWGANGP:
         Returns:
             Dict: Training history with metrics for each epoch
         """
-        print("Starting C-WGAN-GP training...")
+        print("Starting WGAN-GP training...")
         
         # Initialize W&B
         if self.config.use_wandb and self.config.wandb_project:
@@ -1433,7 +840,6 @@ class SpaceshipCWGANGP:
                         'latent_dim': self.config.latent_dim,
                         'mixed_precision': self.config.mixed_precision,
                         'patience': self.config.patience,
-                        'num_classes': self.num_classes,
                     },
                     reinit=True
                 )
@@ -1593,11 +999,8 @@ class SpaceshipCWGANGP:
         """Run test evaluation with detailed metrics."""
         print("Running test evaluation...")
         
-        # Use test set if available, otherwise validation set
-        if self.test_dl:
-            test_metrics = self._evaluate_on_loader(self.test_dl)
-        else:
-            test_metrics = self.validate_epoch()
+        # Use validation set as test set (common in GAN evaluation)
+        test_metrics = self.validate_epoch()
         
         if test_metrics:
             print(f"\nTEST RESULTS:")
@@ -1611,34 +1014,683 @@ class SpaceshipCWGANGP:
             print("Generating test images...")
             self.generate_images("test")
             
-        return test_metrics
+        return test_metrics')
+        axes[0, 1].set_ylabel('Accuracy (%)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # F1 Score plot
+        axes[1, 0].plot(epochs, [m.get('f1_score', 0) for m in train_data], 'b-', label='Train', linewidth=2)
+        if val_data and any(val_data):
+            val_f1s = [m.get('f1_score', 0) for m in val_data if m]
+            axes[1, 0].plot(val_epochs, val_f1s, 'r-', label='Validation', linewidth=2)
+        axes[1, 0].set_title('F1 Score')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('F1 Score')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Learning rate plot (if available)
+        if hasattr(self, 'lr_history') and self.lr_history:
+            axes[1, 1].plot(epochs, self.lr_history, 'g-', linewidth=2)
+            axes[1, 1].set_title('Learning Rate')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Learning Rate')
+            axes[1, 1].set_yscale('log')
+        else:
+            axes[1, 1].text(0.5, 0.5, 'Learning Rate\nHistory\nNot Available', 
+                           ha='center', va='center', transform=axes[1, 1].transAxes,
+                           fontsize=12, alpha=0.5)
+            axes[1, 1].set_title('Learning Rate')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Plot saved: {save_path}")
+        
+        plt.show()
 
-    def _evaluate_on_loader(self, dataloader) -> Dict[str, float]:
-        """Evaluate on a specific dataloader."""
+
+class SpaceshipCWGANGP:
+    """
+    Enhanced C-WGAN-GP implementation with modern training practices and TrainingConfig.
+    
+    Features:
+    - Clean configuration system with TrainingConfig
+    - Mixed precision training for faster performance
+    - Advanced learning rate scheduling for both G and C
+    - Comprehensive metrics tracking and logging
+    - Flexible checkpoint saving/loading
+    - Better error handling and validation
+    - W&B integration with rich logging
+    - Automatic image generation and saving
+    """
+
+    def __init__(self, generator, critic, dataset, config: TrainingConfig_CWGANGP):
+        """
+        Initialize the WGAN-GP trainer.
+        
+        Args:
+            generator: Generator model
+            critic: Critic (discriminator) model  
+            dataset: Full dataset to be split
+            config: WGAN-GP training configuration
+        """
+        self.config = config
+        self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
+        
+        # Models
+        self.generator = generator.to(self.device)
+        self.critic = critic.to(self.device)
+        self.dataset = dataset
+        
+        # Initialize training components
+        self._setup_directories()
+        self.g_optimizer, self.c_optimizer = self._configure_optimizers()
+        self.g_scheduler, self.c_scheduler = self._configure_schedulers()
+        self.scaler = GradScaler('cuda') if config.mixed_precision and self.device.type == 'cuda' else None
+        
+        # Data loaders
+        self.train_dl, self.val_dl, self.test_dl= self._create_dataloaders()
+        
+        # Training state
+        self.current_epoch = 0
+        self.best_g_val_loss = float('inf')
+        self.patience_counter = 0
+        self.history = {}
+        
+        # Metrics trackers - Using the new CWGAN-GP specific tracker
+        self.train_metrics = CWGANGPMetricsTracker()
+        self.val_metrics = CWGANGPMetricsTracker()
+        
+        print(f"SpaceshipCWGANGP initialized on {self.device}")
+        print(f"Dataset splits: Train={len(self.train_dl.dataset)}, Val={len(self.val_dl.dataset)}")
+        print(f"Generator LR: {config.g_lr}, Critic LR: {config.c_lr}")
+        print(f"Mixed Precision: {config.mixed_precision}, Lambda GP: {config.lambda_gp}")
+
+    def _setup_directories(self):
+        """Create necessary directories."""
+        for dir_name in [self.config.model_dir, self.config.logs_dir, 
+                        self.config.plots_dir, self.config.gen_out_dir]:
+            Path(dir_name).mkdir(parents=True, exist_ok=True)
+
+    def _configure_optimizers(self):
+        """Configure optimizers for generator and critic."""
+        g_optimizer = optim.Adam(
+            self.generator.parameters(),
+            lr=self.config.g_lr,
+            betas=self.config.g_betas
+        )
+        
+        c_optimizer = optim.Adam(
+            self.critic.parameters(),
+            lr=self.config.c_lr,
+            betas=self.config.c_betas
+        )
+        
+        return g_optimizer, c_optimizer
+
+    def _configure_schedulers(self):
+        """Configure learning rate schedulers for both models."""
+        def create_scheduler(optimizer, scheduler_type):
+            if scheduler_type == "none":
+                return None
+            elif scheduler_type == "reduce_on_plateau":
+                return ReduceLROnPlateau(
+                    optimizer,
+                    mode='min',
+                    factor=self.config.scheduler_factor,
+                    patience=self.config.scheduler_patience,
+                    min_lr=self.config.scheduler_min_lr,
+                    verbose=True
+                )
+            elif scheduler_type == "cosine":
+                return CosineAnnealingLR(
+                    optimizer,
+                    T_max=self.config.scheduler_t_max,
+                    eta_min=self.config.scheduler_eta_min
+                )
+            elif scheduler_type == "step":
+                return StepLR(
+                    optimizer,
+                    step_size=self.config.scheduler_step_size,
+                    gamma=self.config.scheduler_gamma
+                )
+            return None
+
+        g_scheduler = create_scheduler(self.g_optimizer, self.config.g_scheduler_type)
+        c_scheduler = create_scheduler(self.c_optimizer, self.config.c_scheduler_type)
+        
+        return g_scheduler, c_scheduler
+
+    def _create_dataloaders(self) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
+        """Create train, validation, and optionally test dataloaders."""
+        dataset_size = len(self.dataset)
+        ratios = self.config.ratios
+        
+        if len(ratios) == 2:
+            train_size = int(ratios[0] * dataset_size)
+            val_size = dataset_size - train_size
+            splits = [train_size, val_size]
+        else:  # len(ratios) == 3
+            train_size = int(ratios[0] * dataset_size)
+            val_size = int(ratios[1] * dataset_size)
+            test_size = dataset_size - train_size - val_size
+            splits = [train_size, val_size, test_size]
+        
+        datasets = random_split(self.dataset, splits)
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            datasets[0],
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory and self.device.type == 'cuda',
+            persistent_workers=self.config.num_workers > 0
+        )
+        
+        val_loader = DataLoader(
+            datasets[1],
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory and self.device.type == 'cuda',
+            persistent_workers=self.config.num_workers > 0
+        )
+        
+        test_loader = None
+
+        if len(datasets) == 3:
+            test_loader = DataLoader(
+                datasets[2],
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                num_workers=self.config.num_workers,
+                pin_memory=self.config.pin_memory and self.device.type == 'cuda',
+                persistent_workers=self.config.num_workers > 0
+            )
+        
+        return train_loader, val_loader, test_loader
+    
+    def _sample_noise(self, batch_size: int) -> torch.Tensor:
+        """Generate random noise for generator input."""
+        return torch.randn(
+            batch_size, 
+            self.config.latent_dim, 
+            *self.config.noise_dim, 
+            device=self.device
+        )
+
+    def _critic_to_scalar(self, critic_out: torch.Tensor) -> torch.Tensor:
+        """
+        Ensure critic output is a per-sample scalar tensor of shape (B,).
+        Handles both scalar outputs and patch-based discriminators.
+        """
+        if critic_out.dim() == 1:
+            return critic_out
+        # Reduce spatial dimensions if they exist
+        return critic_out.view(critic_out.size(0), -1).mean(dim=1)
+
+    def gradient_penalty(self, labels, real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> torch.Tensor:
+        """Compute gradient penalty for CWGAN-GP."""
+        batch_size = real_imgs.size(0)
+        
+        # Random interpolation factor
+        alpha = torch.rand(batch_size, *([1] * (real_imgs.dim() - 1)), device=self.device)
+        
+        # Interpolated images
+        interpolated = (alpha * real_imgs + (1 - alpha) * fake_imgs).requires_grad_(True)
+        
+        # Critic output for interpolated images
+        c_interpolated = self.critic(interpolated, labels)
+        c_interpolated = self._critic_to_scalar(c_interpolated)
+        
+        # Compute gradients
+        grad_outputs = torch.ones_like(c_interpolated, device=self.device)
+        gradients = torch.autograd.grad(
+            outputs=c_interpolated,
+            inputs=interpolated,
+            grad_outputs=grad_outputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        
+        # Gradient penalty
+        gradients = gradients.view(batch_size, -1)
+        grad_norm = gradients.norm(2, dim=1)
+        gp = ((grad_norm - 1.0) ** 2).mean()
+        
+        return gp
+
+    def critic_loss(self, labels, real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute critic loss with gradient penalty."""
+        # Generate fake labels (zeros) for fake images
+        fake_labels = torch.zeros_like(labels, device=self.device)
+        
+        # Critic outputs
+        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
+        real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
+        
+        # Wasserstein distance
+        wasserstein_distance = fake_scores.mean() - real_scores.mean()
+        
+        # Gradient penalty
+        gp = self.gradient_penalty(labels, real_imgs, fake_imgs)
+        
+        # Total critic loss
+        c_loss = wasserstein_distance + self.config.lambda_gp * gp
+        
+        return c_loss, fake_scores, real_scores, gp
+
+    def generator_loss(self, labels, fake_imgs: torch.Tensor) -> torch.Tensor:
+        """Compute generator loss."""
+        fake_labels = torch.zeros_like(labels, device=self.device)
+        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
+        return -fake_scores.mean()
+
+    def train_epoch(self) -> Dict[str, float]:
+        """Run one training epoch."""
+        self.generator.train()
+        self.critic.train()
+        self.train_metrics.reset()
+        
+        total_batches = len(self.train_dl)
+        
+        for batch_idx, (real_imgs, labels) in enumerate(self.train_dl):
+            
+            real_imgs = real_imgs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+            batch_size = real_imgs.size(0)
+            
+            # Train Critic n_critic times
+            batch_c_losses = []
+            batch_fake_scores = []
+            batch_real_scores = []
+            batch_gps = []
+            
+            for _ in range(self.config.n_critic):
+                self.c_optimizer.zero_grad()
+                
+                # Generate fake images
+                z = self._sample_noise(batch_size)
+                with torch.no_grad():
+                    fake_imgs = self.generator(z, labels)
+                
+                # Critic loss with mixed precision
+                with autocast('cuda', enabled=self.scaler is not None):
+                    c_loss, fake_scores, real_scores, gp = self.critic_loss(labels, real_imgs, fake_imgs)
+                
+                # Backward pass for critic
+                if self.scaler:
+                    self.scaler.scale(c_loss).backward()
+                    if self.config.gradient_clip_norm:
+                        self.scaler.unscale_(self.c_optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.critic.parameters(), 
+                            self.config.gradient_clip_norm
+                        )
+                    self.scaler.step(self.c_optimizer)
+                    self.scaler.update()
+                else:
+                    c_loss.backward()
+                    if self.config.gradient_clip_norm:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.critic.parameters(), 
+                            self.config.gradient_clip_norm
+                        )
+                    self.c_optimizer.step()
+                
+                # Track critic metrics
+                batch_c_losses.append(c_loss.item())
+                batch_fake_scores.append(fake_scores.mean().item())
+                batch_real_scores.append(real_scores.mean().item())
+                batch_gps.append(gp.item())
+            
+            # Train Generator once
+            self.g_optimizer.zero_grad()
+            
+            z = self._sample_noise(batch_size)
+            fake_imgs = self.generator(z, labels)
+            
+            # Generator loss with mixed precision
+            with autocast('cuda', enabled=self.scaler is not None):
+                g_loss = self.generator_loss(labels, fake_imgs)
+            
+            # Backward pass for generator
+            if self.scaler:
+                self.scaler.scale(g_loss).backward()
+                if self.config.gradient_clip_norm:
+                    self.scaler.unscale_(self.g_optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.generator.parameters(), 
+                        self.config.gradient_clip_norm
+                    )
+                self.scaler.step(self.g_optimizer)
+                self.scaler.update()
+            else:
+                g_loss.backward()
+                if self.config.gradient_clip_norm:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.generator.parameters(), 
+                        self.config.gradient_clip_norm
+                    )
+                self.g_optimizer.step()
+            
+            # Update training metrics using the new method signature
+            avg_c_loss = np.mean(batch_c_losses)
+            avg_fake_score = np.mean(batch_fake_scores)
+            avg_real_score = np.mean(batch_real_scores)
+            avg_gp = np.mean(batch_gps)
+            
+            self.train_metrics.update(
+                g_loss.item(), 
+                avg_c_loss, 
+                avg_fake_score, 
+                avg_real_score, 
+                avg_gp
+            )
+            
+            # Progress logging
+            if (self.config.display_per_batch > 0 and 
+                batch_idx % self.config.display_per_batch == 0):
+                progress_pct = (batch_idx / total_batches) * 100
+                print(f'Batch {batch_idx}/{total_batches} ({progress_pct:.1f}%) || '
+                      f'G Loss: {g_loss.item():.4f} || C Loss: {avg_c_loss:.4f} || '
+                      f'Fake: {avg_fake_score:.4f} || Real: {avg_real_score:.4f} || GP: {avg_gp:.4f}')
+                print('-'*120)
+            
+            # Optional cache clearing
+            if (self.config.clear_cache_every_n_batches > 0 and 
+                batch_idx % self.config.clear_cache_every_n_batches == 0 and 
+                self.device.type == 'cuda'):
+                torch.cuda.empty_cache()
+        
+        return self.train_metrics.compute_means()
+
+    def validate_epoch(self) -> Dict[str, float]:
+        """Run validation epoch."""
         self.generator.eval()
         self.critic.eval()
-        temp_metrics = MetricsTracker()
+        self.val_metrics.reset()
         
         with torch.no_grad():
-            for real_imgs, labels in dataloader:
+            for batch_idx, (real_imgs, labels) in enumerate(self.val_dl):
+                
                 real_imgs = real_imgs.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
                 batch_size = real_imgs.size(0)
                 
-                # Generate fake images with labels
+                # Generate fake images
                 z = self._sample_noise(batch_size)
                 fake_imgs = self.generator(z, labels)
                 
-                # Compute losses (no gradient penalty in evaluation)
-                fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
+                # Generate fake labels for validation
+                fake_labels = torch.zeros_like(labels, device=self.device)
+                
+                # Compute losses (no gradient penalty in validation)
+                fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
                 real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
                 
                 c_loss = fake_scores.mean() - real_scores.mean()
                 g_loss = -fake_scores.mean()
                 
-                temp_metrics.update(
-                    g_loss.item(), c_loss.item(), 
-                    fake_scores.mean().item(), real_scores.mean().item()
+                # Update validation metrics (no GP in validation)
+                self.val_metrics.update(
+                    g_loss.item(), 
+                    c_loss.item(), 
+                    fake_scores.mean().item(), 
+                    real_scores.mean().item()
                 )
         
-        return temp_metrics.compute_means()
+        return self.val_metrics.compute_means()
+
+    def generate_images(self, epoch: int):
+        """Generate and save sample images."""
+        try:
+            self.generator.eval()
+            with torch.no_grad():
+                z = self._sample_noise(self.config.num_pictures)
+                # Generate random labels for image generation
+                random_labels = torch.randint(0, 10, (self.config.num_pictures,), device=self.device)
+                fake_imgs = self.generator(z, random_labels).cpu()
+                # Normalize to [0, 1]
+                fake_imgs = (fake_imgs + 1) / 2.0
+                fake_imgs = torch.clamp(fake_imgs, 0, 1)
+            
+            # Create grid and save
+            img_grid = torchvision.utils.make_grid(fake_imgs, nrow=self.config.num_rows)
+            save_path = Path(self.config.gen_out_dir) / f'generated_epoch_{epoch}.png'
+            torchvision.utils.save_image(img_grid, save_path)
+            
+            self.generator.train()
+            print(f"Images saved: {save_path}")
+            
+        except Exception as e:
+            print(f"Error generating images: {e}")
+
+    def save_checkpoint(self, epoch: int, is_best: bool = False):
+        """Save model checkpoint with comprehensive state."""
+        try:
+            checkpoint = {
+                'epoch': epoch,
+                'generator_state_dict': self.generator.state_dict(),
+                'critic_state_dict': self.critic.state_dict(),
+                'g_optimizer_state_dict': self.g_optimizer.state_dict(),
+                'c_optimizer_state_dict': self.c_optimizer.state_dict(),
+                'g_scheduler_state_dict': self.g_scheduler.state_dict() if self.g_scheduler else None,
+                'c_scheduler_state_dict': self.c_scheduler.state_dict() if self.c_scheduler else None,
+                'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+                'best_g_val_loss': self.best_g_val_loss,
+                'config': self.config,
+                'history': self.history,
+            }
+            
+            # Save regular checkpoint
+            checkpoint_path = Path(self.config.model_dir) / f"checkpoint_epoch_{epoch}.pth"
+            torch.save(checkpoint, checkpoint_path)
+            
+            # Save best model
+            if is_best:
+                best_path = Path(self.config.model_dir) / "best_checkpoint.pth"
+                torch.save(checkpoint, best_path)
+                print(f"Best checkpoint saved: {best_path}")
+            
+            print(f"Checkpoint saved: {checkpoint_path}")
+            
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+
+    def load_checkpoint(self, checkpoint_path: str) -> Dict:
+        """Load model checkpoint."""
+        try:
+            if not Path(checkpoint_path).exists():
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model states
+            self.generator.load_state_dict(checkpoint['generator_state_dict'])
+            self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
+            self.c_optimizer.load_state_dict(checkpoint['c_optimizer_state_dict'])
+            
+            # Load scheduler states if they exist
+            if self.g_scheduler and checkpoint.get('g_scheduler_state_dict'):
+                self.g_scheduler.load_state_dict(checkpoint['g_scheduler_state_dict'])
+            if self.c_scheduler and checkpoint.get('c_scheduler_state_dict'):
+                self.c_scheduler.load_state_dict(checkpoint['c_scheduler_state_dict'])
+            
+            # Load scaler state if it exists
+            if self.scaler and checkpoint.get('scaler_state_dict'):
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            # Load training state
+            self.current_epoch = checkpoint['epoch']
+            self.best_g_val_loss = checkpoint.get('best_g_val_loss', float('inf'))
+            self.history = checkpoint.get('history', {})
+            
+            print(f"Checkpoint loaded: {checkpoint_path} (epoch {self.current_epoch})")
+            return checkpoint
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            raise
+
+    # Legacy methods for backward compatibility
+    def save_weights(self, weight_dir=None, generator_name=None, critic_name=None):
+        """Save model weights (legacy method)."""
+        weight_dir = weight_dir or self.config.model_dir
+        generator_name = generator_name or f"{self.config.gen_save_name}.pth"
+        critic_name = critic_name or f"{self.config.critic_save_name}.pth"
+        
+        try:
+            os.makedirs(weight_dir, exist_ok=True)
+            torch.save(self.generator.state_dict(), os.path.join(weight_dir, generator_name))
+            torch.save(self.critic.state_dict(), os.path.join(weight_dir, critic_name))
+            print(f"Models saved to {weight_dir}")
+        except Exception as e:
+            print(f"Error saving weights: {e}")
+
+    def load_weights(self, weight_dir=None, generator_name=None, critic_name=None):
+        """Load model weights (legacy method)."""
+        weight_dir = weight_dir or self.config.model_dir
+        generator_name = generator_name or f"{self.config.gen_save_name}.pth"
+        critic_name = critic_name or f"{self.config.critic_save_name}.pth"
+        
+        try:
+            gen_path = os.path.join(weight_dir, generator_name)
+            critic_path = os.path.join(weight_dir, critic_name)
+            
+            if os.path.exists(gen_path):
+                self.generator.load_state_dict(torch.load(gen_path, map_location=self.device))
+                print(f"Generator loaded from {gen_path}")
+            
+            if os.path.exists(critic_path):
+                self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
+                print(f"Critic loaded from {critic_path}")
+                
+        except Exception as e:
+            print(f"Error loading weights: {e}")
+
+    def save_optimizers(self, opt_dir="optimizers"):
+        """Save optimizer states (legacy method)."""
+        try:
+            os.makedirs(opt_dir, exist_ok=True)
+            torch.save(self.g_optimizer.state_dict(), os.path.join(opt_dir, 'g_optimizer.pth'))
+            torch.save(self.c_optimizer.state_dict(), os.path.join(opt_dir, 'c_optimizer.pth'))
+            print(f"Optimizers saved to {opt_dir}")
+        except Exception as e:
+            print(f"Error saving optimizers: {e}")
+
+    def load_optimizers(self, opt_dir="optimizers"):
+        """Load optimizer states (legacy method)."""
+        try:
+            g_path = os.path.join(opt_dir, 'g_optimizer.pth')
+            c_path = os.path.join(opt_dir, 'c_optimizer.pth')
+            
+            if os.path.exists(g_path):
+                self.g_optimizer.load_state_dict(torch.load(g_path, map_location=self.device))
+                print(f"Generator optimizer loaded from {g_path}")
+            if os.path.exists(c_path):
+                self.c_optimizer.load_state_dict(torch.load(c_path, map_location=self.device))
+                print(f"Critic optimizer loaded from {c_path}")
+                
+        except Exception as e:
+            print(f"Error loading optimizers: {e}")
+
+    def plot_losses(self, history: Dict, kind: str = "training"):
+        """Plot training curves with enhanced visualization."""
+        if not history:
+            print("No history to plot")
+            return
+
+        g_losses, c_losses, wasserstein_distances = [], [], []
+        fake_scores, real_scores, gp_values = [], [], []
+        epochs = []
+
+        for epoch_key, values in history.items():
+            if kind not in values:
+                continue
+            
+            metrics = values[kind]
+            if not metrics:
+                continue
+
+            epoch_num = int(epoch_key.split("_")[-1])
+            epochs.append(epoch_num)
+            
+            g_losses.append(metrics.get('g_loss_mean', 0))
+            c_losses.append(metrics.get('c_loss_mean', 0))
+            wasserstein_distances.append(metrics.get('wasserstein_distance', 0))
+            fake_scores.append(metrics.get('fake_score_mean', 0))
+            real_scores.append(metrics.get('real_score_mean', 0))
+            gp_values.append(metrics.get('gp_mean', 0))
+
+        if not g_losses:
+            print(f"No {kind} data to plot")
+            return
+
+        # Create comprehensive plot
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle(f'WGAN-GP {kind.capitalize()} Metrics', fontsize=16, fontweight='bold')
+
+        # Generator and Critic Losses
+        axes[0, 0].plot(epochs, g_losses, 'b-', label='Generator', linewidth=2, marker='o')
+        axes[0, 0].plot(epochs, c_losses, 'r-', label='Critic', linewidth=2, marker='s')
+        axes[0, 0].set_title('Generator vs Critic Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # Wasserstein Distance
+        axes[0, 1].plot(epochs, wasserstein_distances, 'g-', linewidth=2, marker='o')
+        axes[0, 1].set_title('Wasserstein Distance')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Wasserstein Distance')
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # Critic Scores
+        axes[0, 2].plot(epochs, real_scores, 'g-', label='Real Scores', linewidth=2, marker='o')
+        axes[0, 2].plot(epochs, fake_scores, 'r-', label='Fake Scores', linewidth=2, marker='s')
+        axes[0, 2].set_title('Critic Scores')
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Score')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+
+        # Gradient Penalty
+        axes[1, 0].plot(epochs, gp_values, linewidth=2, marker='o')
+        axes[1, 0].set_title('Gradient Penalty')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('GP Value')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # Generator Loss (Detailed)
+        axes[1, 1].plot(epochs, g_losses, 'b-', linewidth=2, marker='o')
+        axes[1, 1].set_title('Generator Loss (Detailed)')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('G Loss')
+        axes[1, 1].grid(True, alpha=0.3)
+
+        # Score Difference (Real - Fake)
+        score_diff = np.array(real_scores) - np.array(fake_scores)
+        axes[1, 2].plot(epochs, score_diff, linewidth=2, marker='o')
+        axes[1, 2].set_title('Score Difference (Real - Fake)')
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Score Difference')
+        axes[1, 2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Save plot
+        plot_path = Path(self.config.plots_dir) / f"wgan_gp_{kind}_metrics.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved: {plot_path}")
+
+        plt.show()
+        plt.close()
