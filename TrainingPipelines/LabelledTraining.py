@@ -506,6 +506,7 @@ class SpaceshipClassifier(BaseTrainer):
                 print('-'*80)
                 
         return self.train_metrics.compute()
+    
     def validate_epoch(self, mode: str = "val") -> Dict[str, float]:
         """Run validation/test epoch."""
         if mode == "val":
@@ -772,249 +773,6 @@ class SpaceshipClassifier(BaseTrainer):
             axes[0, 1].plot(val_epochs, val_accs, 'r-', label='Validation', linewidth=2)
         axes[0, 1].set_title('Accuracy')
         axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Distance')
-        axes[0, 1].grid(True, alpha=0.3)
-
-        # Critic Scores
-        axes[0, 2].plot(epochs, real_scores, 'g-', label='Real Scores', linewidth=2, marker='o')
-        axes[0, 2].plot(epochs, fake_scores, 'r-', label='Fake Scores', linewidth=2, marker='s')
-        axes[0, 2].set_title('Critic Scores')
-        axes[0, 2].set_xlabel('Epoch')
-        axes[0, 2].set_ylabel('Score')
-        axes[0, 2].legend()
-        axes[0, 2].grid(True, alpha=0.3)
-
-        # Gradient Penalty
-        axes[1, 0].plot(epochs, gp_values, 'purple', linewidth=2, marker='o')
-        axes[1, 0].set_title('Gradient Penalty')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('GP Value')
-        axes[1, 0].grid(True, alpha=0.3)
-
-        # Generator Loss Zoomed
-        axes[1, 1].plot(epochs, g_losses, 'b-', linewidth=2, marker='o')
-        axes[1, 1].set_title('Generator Loss (Detailed)')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('G Loss')
-        axes[1, 1].grid(True, alpha=0.3)
-
-        # Score Difference (Real - Fake)
-        score_diff = np.array(real_scores) - np.array(fake_scores)
-        axes[1, 2].plot(epochs, score_diff, 'orange', linewidth=2, marker='o')
-        axes[1, 2].set_title('Score Difference (Real - Fake)')
-        axes[1, 2].set_xlabel('Epoch')
-        axes[1, 2].set_ylabel('Score Difference')
-        axes[1, 2].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        
-        # Save plot
-        plot_path = Path(self.config.plots_dir) / f"wgan_gp_{kind}_metrics.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"Plot saved: {plot_path}")
-        
-        plt.show()
-        plt.close()
-
-    def fit(self):
-        """
-        Main training loop with validation, early stopping, and comprehensive logging.
-        
-        Returns:
-            Dict: Training history with metrics for each epoch
-        """
-        print("Starting WGAN-GP training...")
-        
-        # Initialize W&B
-        if self.config.use_wandb and self.config.wandb_project:
-            try:
-                wandb.init(
-                    project=self.config.wandb_project,
-                    config={
-                        'num_epochs': self.config.num_epochs,
-                        'batch_size': self.config.batch_size,
-                        'g_lr': self.config.g_lr,
-                        'c_lr': self.config.c_lr,
-                        'lambda_gp': self.config.lambda_gp,
-                        'n_critic': self.config.n_critic,
-                        'latent_dim': self.config.latent_dim,
-                        'mixed_precision': self.config.mixed_precision,
-                        'patience': self.config.patience,
-                    },
-                    reinit=True
-                )
-                print("W&B initialized successfully")
-            except Exception as e:
-                print(f"W&B initialization failed: {e}")
-                self.config.use_wandb = False
-
-        start_time = time.time()
-        
-        try:
-            for epoch in range(self.config.num_epochs):
-                self.current_epoch = epoch
-                epoch_start = time.time()
-                
-                print("-" * 100)
-                print(f"\t\t\t\t\tEPOCH {epoch}\t\t\t\t\t")
-                print("-" * 100)
-
-                # Training
-                train_metrics = self.train_epoch()
-
-                # Validation
-                val_metrics = {}
-                if epoch % self.config.validate_per_epoch == 0:
-                    val_metrics = self.validate_epoch()
-
-                # Update history
-                self.history[f"epoch_{epoch}"] = {
-                    "training": train_metrics,
-                    "validating": val_metrics
-                }
-
-                # Logging
-                epoch_time = time.time() - epoch_start
-                g_lr = self.g_optimizer.param_groups[0]['lr']
-                c_lr = self.c_optimizer.param_groups[0]['lr']
-                
-                print(f"Epoch time: {epoch_time:.2f}s | G_LR: {g_lr:.2e} | C_LR: {c_lr:.2e}")
-                print(f"Train - G Loss: {train_metrics.get('g_loss_mean', 0):.4f} | "
-                      f"C Loss: {train_metrics.get('c_loss_mean', 0):.4f} | "
-                      f"W-Dist: {train_metrics.get('wasserstein_distance', 0):.4f}")
-                
-                if val_metrics:
-                    print(f"Val   - G Loss: {val_metrics.get('g_loss_mean', 0):.4f} | "
-                          f"C Loss: {val_metrics.get('c_loss_mean', 0):.4f} | "
-                          f"W-Dist: {val_metrics.get('wasserstein_distance', 0):.4f}")
-
-                # Early stopping and model saving
-                if val_metrics:
-                    val_g_loss = val_metrics.get('g_loss_mean', float('inf'))
-                    improved = val_g_loss < self.best_g_val_loss - self.config.min_delta
-                    
-                    if improved:
-                        self.best_g_val_loss = val_g_loss
-                        self.patience_counter = 0
-                        print("-" * 100)
-                        print("<--- Validation improved! Best model saved! --->")
-                        print("-" * 100)
-                        
-                        if self.config.save_best_only:
-                            self.save_checkpoint(epoch, is_best=True)
-                        
-                        # Save individual model weights for backward compatibility
-                        gen_name = f"{self.config.gen_save_name}_epoch_{epoch}_best.pth"
-                        critic_name = f"{self.config.critic_save_name}_epoch_{epoch}_best.pth"
-                        self.save_weights(self.config.model_dir, gen_name, critic_name)
-                    else:
-                        self.patience_counter += 1
-                        print(f"No improvement. Patience: {self.patience_counter}/{self.config.patience}")
-                        
-                        if self.patience_counter >= self.config.patience:
-                            print("Early stopping triggered due to no progress.")
-                            break
-
-                # Save last checkpoint
-                if self.config.save_last:
-                    self.save_checkpoint(epoch)
-
-                # Generate and save images
-                if self.config.save_images_every_epoch:
-                    self.generate_images(epoch)
-
-                # Update schedulers
-                if self.g_scheduler:
-                    if isinstance(self.g_scheduler, ReduceLROnPlateau):
-                        if val_metrics:
-                            self.g_scheduler.step(val_metrics.get('g_loss_mean', 0))
-                    else:
-                        self.g_scheduler.step()
-                        
-                if self.c_scheduler:
-                    if isinstance(self.c_scheduler, ReduceLROnPlateau):
-                        if val_metrics:
-                            self.c_scheduler.step(val_metrics.get('c_loss_mean', 0))
-                    else:
-                        self.c_scheduler.step()
-
-                # W&B logging
-                if self.config.use_wandb:
-                    log_dict = {
-                        'epoch': epoch,
-                        'g_lr': g_lr,
-                        'c_lr': c_lr,
-                        'epoch_time': epoch_time,
-                        'train_g_loss': train_metrics.get('g_loss_mean', 0),
-                        'train_c_loss': train_metrics.get('c_loss_mean', 0),
-                        'train_wasserstein_dist': train_metrics.get('wasserstein_distance', 0),
-                        'train_fake_score': train_metrics.get('fake_score_mean', 0),
-                        'train_real_score': train_metrics.get('real_score_mean', 0),
-                        'train_gp': train_metrics.get('gp_mean', 0),
-                    }
-                    
-                    if val_metrics:
-                        log_dict.update({
-                            'val_g_loss': val_metrics.get('g_loss_mean', 0),
-                            'val_c_loss': val_metrics.get('c_loss_mean', 0),
-                            'val_wasserstein_dist': val_metrics.get('wasserstein_distance', 0),
-                            'val_fake_score': val_metrics.get('fake_score_mean', 0),
-                            'val_real_score': val_metrics.get('real_score_mean', 0),
-                        })
-                    
-                    # Log generated images to W&B
-                    if self.config.save_images_every_epoch:
-                        try:
-                            img_path = Path(self.config.gen_out_dir) / f'generated_epoch_{epoch}.png'
-                            if img_path.exists():
-                                log_dict['generated_images'] = wandb.Image(str(img_path))
-                        except Exception as e:
-                            print(f"Could not log images to W&B: {e}")
-                    
-                    wandb.log(log_dict)
-
-        except KeyboardInterrupt:
-            print("\nTraining interrupted by user")
-        except Exception as e:
-            print(f"\nTraining failed: {e}")
-            raise
-        finally:
-            total_time = time.time() - start_time
-            print(f"\nTraining completed in {total_time/60:.2f} minutes")
-            
-            if self.config.use_wandb:
-                try:
-                    wandb.finish()
-                except:
-                    pass
-
-        # Generate final plots
-        self.plot_losses(self.history, "training")
-        if any('validating' in hist and hist['validating'] for hist in self.history.values()):
-            self.plot_losses(self.history, "validating")
-
-        return self.history
-
-    def test(self):
-        """Run test evaluation with detailed metrics."""
-        print("Running test evaluation...")
-        
-        # Use validation set as test set (common in GAN evaluation)
-        test_metrics = self.validate_epoch()
-        
-        if test_metrics:
-            print(f"\nTEST RESULTS:")
-            print(f"Generator Loss: {test_metrics['g_loss_mean']:.4f}")
-            print(f"Critic Loss: {test_metrics['c_loss_mean']:.4f}")
-            print(f"Wasserstein Distance: {test_metrics['wasserstein_distance']:.4f}")
-            print(f"Fake Score: {test_metrics['fake_score_mean']:.4f}")
-            print(f"Real Score: {test_metrics['real_score_mean']:.4f}")
-            
-            # Generate test images
-            print("Generating test images...")
-            self.generate_images("test")
-            
-        return test_metrics')
         axes[0, 1].set_ylabel('Accuracy (%)')
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
@@ -1031,26 +789,30 @@ class SpaceshipClassifier(BaseTrainer):
         axes[1, 0].grid(True, alpha=0.3)
         
         # Learning rate plot (if available)
+        lr_history = [self.optimizer.param_groups[0]['lr']] * len(train_data)  # Placeholder for LR history
         if hasattr(self, 'lr_history') and self.lr_history:
             axes[1, 1].plot(epochs, self.lr_history, 'g-', linewidth=2)
-            axes[1, 1].set_title('Learning Rate')
-            axes[1, 1].set_xlabel('Epoch')
-            axes[1, 1].set_ylabel('Learning Rate')
-            axes[1, 1].set_yscale('log')
         else:
-            axes[1, 1].text(0.5, 0.5, 'Learning Rate\nHistory\nNot Available', 
-                           ha='center', va='center', transform=axes[1, 1].transAxes,
-                           fontsize=12, alpha=0.5)
-            axes[1, 1].set_title('Learning Rate')
+            axes[1, 1].plot(epochs, lr_history, 'g-', linewidth=2)
+        axes[1, 1].set_title('Learning Rate')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Learning Rate')
+        axes[1, 1].set_yscale('log')
         axes[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
         
+        # Save plot if path provided
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Plot saved: {save_path}")
+        else:
+            plot_path = Path(self.config.plots_dir) / "training_history.png"
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"Plot saved: {plot_path}")
         
         plt.show()
+        plt.close()
 
 
 class SpaceshipCWGANGP:
