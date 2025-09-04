@@ -18,7 +18,7 @@ import torchvision
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torch import amp
-from torch.amp import GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import wandb
 
