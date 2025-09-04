@@ -754,7 +754,7 @@ class SpaceshipClassifier(BaseTrainer):
         fig.suptitle('Training History', fontsize=16, fontweight='bold')
         
         # Loss plot
-                    axes[0, 0].plot(epochs, [m.get('loss', 0) for m in train_data], 'b-', label='Train', linewidth=2)
+        axes[0, 0].plot(epochs, [m.get('loss', 0) for m in train_data], 'b-', label='Train', linewidth=2)
         if val_data and any(val_data):
             val_epochs = [i+1 for i, m in enumerate(val_data) if m]
             val_losses = [m.get('loss', 0) for m in val_data if m]
