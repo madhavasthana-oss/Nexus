@@ -18,7 +18,7 @@ import torchvision
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torch import amp
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import wandb
 
@@ -87,7 +87,7 @@ class TrainingConfig_CWGANGP:
     num_epochs: int = 100
     batch_size: int = 256
     g_lr: float = 2e-4
-    c_lr: float - 1e-4
+    c_lr: float = 1e-4
     g_betas: Tuple[float, float] = (0.0, 0.9)
     c_betas: Tuple[float, float] = (0.0, 0.9)
     g_weight_decay: float = 1e-4
@@ -101,14 +101,51 @@ class TrainingConfig_CWGANGP:
     mixed_precision: bool = True
     gradient_clip_norm: Optional[float] = 1.0
     accumulation_steps: int = 1
-    
+        
+    # WGAN-GP specific
+    lambda_gp: float = 10.0
+    n_critic: int = 5
+
+    # Training parameters
+    num_classes: int = 10
+    latent_dim: int = 128
+    noise_dim: Tuple[int, ...] = (1, 1)
+
+    # Generation
+    num_pictures: int = 64
+    num_rows: int = 8
+    gen_out_dir: str = "generated_images"
+    save_images_every_epoch: bool = True
+
+    # Model saving
+    model_dir: str = "checkpoints"  # Added missing model_dir
+    gen_save_name: str = "generator"
+    critic_save_name: str = "critic"
+
+    # Scheduler parameters
+    g_scheduler_type: str = "none"
+    c_scheduler_type: str = "none"
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 3
+    scheduler_min_lr: float = 1e-7
+    scheduler_t_max: int = 50
+    scheduler_eta_min: float = 1e-6
+    scheduler_step_size: int = 15
+    scheduler_gamma: float = 0.1
+
+    # Additional training options
+    use_real_labels_for_fake: bool = True
+    clear_cache_every_n_batches: int = 0
+    use_wandb: bool = False
+
     # Early stopping
     patience: int = 7
     min_delta: float = 1e-4
     validate_per_epoch: int = 1
     display_per_batch: int = 5
-    # Scheduler
-    scheduler_type: str = "reduce_on_plateau"  # "reduce_on_plateau", "cosine", "step", "none"
+    
+    # Scheduler (legacy - keeping for backward compatibility)
+    scheduler_type: str = "reduce_on_plateau"
     scheduler_params: Dict[str, Any] = field(default_factory=lambda: {
         "reduce_on_plateau": {"factor": 0.5, "patience": 3, "min_lr": 1e-7},
         "cosine": {"T_max": 50, "eta_min": 1e-6},
@@ -130,8 +167,10 @@ class TrainingConfig_CWGANGP:
         """Validate configuration after initialization."""
         if self.num_epochs <= 0:
             raise ValueError("num_epochs must be positive")
-        if not 0 < self.lr < 1:
-            raise ValueError("lr must be between 0 and 1")
+        if not (0 < self.g_lr < 1):
+            raise ValueError("g_lr must be between 0 and 1")
+        if not (0 < self.c_lr < 1):
+            raise ValueError("c_lr must be between 0 and 1")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if len(self.ratios) not in [2, 3]:
@@ -140,9 +179,14 @@ class TrainingConfig_CWGANGP:
             raise ValueError("ratios must sum to 1.0")
         if self.scheduler_type not in ["reduce_on_plateau", "cosine", "step", "none"]:
             raise ValueError(f"Invalid scheduler_type: {self.scheduler_type}")
-
-
-
+        if self.num_classes <= 0:
+            raise ValueError("num_classes must be positive")
+        if self.latent_dim <= 0:
+            raise ValueError("latent_dim must be positive")
+        if self.lambda_gp < 0:
+            raise ValueError("lambda_gp must be non-negative")
+        if self.n_critic <= 0:
+            raise ValueError("n_critic must be positive")
 
 class MetricsTracker:
     """Track and compute various metrics during training."""
@@ -286,6 +330,195 @@ class CWGANGPMetricsTracker:
                     self.class_fake_scores[class_id].append(fake_score)
                     self.class_real_scores[class_id].append(real_score)
     
+    def plot_class_specific_metrics(self, history: Dict, plots_dir = 'plots', kind: str = "training"):
+        """
+        Plot class-specific metrics for conditional GAN training.
+        
+        Args:
+            history: Training history dictionary
+            kind: Type of metrics to plot ("training" or "validating")
+        """
+        if not history:
+            print("❌ No history to plot")
+            return
+
+        # Extract class-specific metrics
+        class_g_losses = {i: [] for i in range(self.num_classes)}
+        class_c_losses = {i: [] for i in range(self.num_classes)}
+        class_fake_scores = {i: [] for i in range(self.num_classes)}
+        class_real_scores = {i: [] for i in range(self.num_classes)}
+        epochs = []
+
+        for epoch_key, values in history.items():
+            if kind not in values or not values[kind]:
+                continue
+                
+            metrics = values[kind]
+            epoch_num = int(epoch_key.split("_")[-1])
+            epochs.append(epoch_num)
+            
+            # Extract class-specific metrics if they exist
+            for class_id in range(self.num_classes):
+                class_g_losses[class_id].append(
+                    metrics.get(f'class_{class_id}_g_loss_mean', metrics.get('g_loss_mean', 0))
+                )
+                class_c_losses[class_id].append(
+                    metrics.get(f'class_{class_id}_c_loss_mean', metrics.get('c_loss_mean', 0))
+                )
+                class_fake_scores[class_id].append(
+                    metrics.get(f'class_{class_id}_fake_score_mean', metrics.get('fake_score_mean', 0))
+                )
+                class_real_scores[class_id].append(
+                    metrics.get(f'class_{class_id}_real_score_mean', metrics.get('real_score_mean', 0))
+                )
+
+        if not epochs:
+            print(f"❌ No {kind} data to plot")
+            return
+
+        # Create class-specific plots
+        n_classes_to_plot = min(self.num_classes, 8)  # Limit to 8 classes for readability
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle(f'Class-Specific Conditional WGAN-GP {kind.capitalize()} Metrics', 
+                     fontsize=16, fontweight='bold')
+
+        # Define colors for different classes
+        colors = plt.cm.tab10(np.linspace(0, 1, n_classes_to_plot))
+
+        # Plot 1: Generator Loss per Class
+        ax = axes[0, 0]
+        for class_id in range(n_classes_to_plot):
+            if class_g_losses[class_id]:
+                ax.plot(epochs, class_g_losses[class_id], 
+                        color=colors[class_id], linewidth=2, marker='o', 
+                        markersize=3, label=f'Class {class_id}')
+        ax.set_title('Generator Loss by Class')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Generator Loss')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        # Plot 2: Critic Loss per Class
+        ax = axes[0, 1]
+        for class_id in range(n_classes_to_plot):
+            if class_c_losses[class_id]:
+                ax.plot(epochs, class_c_losses[class_id], 
+                        color=colors[class_id], linewidth=2, marker='s', 
+                        markersize=3, label=f'Class {class_id}')
+        ax.set_title('Critic Loss by Class')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Critic Loss')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        # Plot 3: Fake Scores per Class
+        ax = axes[1, 0]
+        for class_id in range(n_classes_to_plot):
+            if class_fake_scores[class_id]:
+                ax.plot(epochs, class_fake_scores[class_id], 
+                        color=colors[class_id], linewidth=2, marker='^', 
+                        markersize=3, label=f'Class {class_id}')
+        ax.set_title('Fake Scores by Class')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Fake Score')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        # Plot 4: Real Scores per Class
+        ax = axes[1, 1]
+        for class_id in range(n_classes_to_plot):
+            if class_real_scores[class_id]:
+                ax.plot(epochs, class_real_scores[class_id], 
+                        color=colors[class_id], linewidth=2, marker='v', 
+                        markersize=3, label=f'Class {class_id}')
+        ax.set_title('Real Scores by Class')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Real Score')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = Path(plots_dir) / f"class_specific_{kind}_metrics.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"📊 Class-specific plot saved: {plot_path}")
+        
+        plt.show()
+        plt.close()
+
+        # Additional plot: Class balance visualization
+        if len(epochs) > 5:  # Only create if we have enough data points
+            self._plot_class_balance_heatmap(history, plots_dir, kind)
+
+    def _plot_class_balance_heatmap(self, history: Dict,  plots_dir = 'plots_heatmap', kind: str):
+        """
+        Create a heatmap showing class balance in training metrics.
+        
+        Args:
+            history: Training history dictionary
+            kind: Type of metrics to plot ("training" or "validating")
+        """
+        try:
+            # Collect class-specific generator losses for heatmap
+            class_metrics_matrix = []
+            epochs = []
+            
+            for epoch_key, values in history.items():
+                if kind not in values or not values[kind]:
+                    continue
+                    
+                metrics = values[kind]
+                epoch_num = int(epoch_key.split("_")[-1])
+                epochs.append(epoch_num)
+                
+                epoch_class_losses = []
+                for class_id in range(min(self.num_classes, 10)):  # Limit to 10 classes
+                    class_loss = metrics.get(f'class_{class_id}_g_loss_mean', metrics.get('g_loss_mean', 0))
+                    epoch_class_losses.append(class_loss)
+                
+                class_metrics_matrix.append(epoch_class_losses)
+            
+            if not class_metrics_matrix:
+                return
+                
+            # Convert to numpy array for heatmap
+            class_metrics_matrix = np.array(class_metrics_matrix)
+            
+            # Create heatmap
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            im = ax.imshow(class_metrics_matrix.T, aspect='auto', cmap='viridis', 
+                           interpolation='nearest')
+            
+            # Set labels
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Class ID')
+            ax.set_title(f'Generator Loss Heatmap by Class ({kind.capitalize()})')
+            
+            # Set ticks
+            ax.set_xticks(np.arange(0, len(epochs), max(1, len(epochs)//10)))
+            ax.set_xticklabels([epochs[i] for i in range(0, len(epochs), max(1, len(epochs)//10))])
+            ax.set_yticks(range(min(self.num_classes, 10)))
+            ax.set_yticklabels([f'Class {i}' for i in range(min(self.num_classes, 10))])
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label('Generator Loss')
+            
+            plt.tight_layout()
+            
+            # Save heatmap
+            heatmap_path = Path(plots_dir) / f"class_balance_heatmap_{kind}.png"
+            plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
+            print(f"📊 Class balance heatmap saved: {heatmap_path}")
+            
+            plt.show()
+            plt.close()
+            
+        except Exception as e:
+            print(f"❌ Error creating class balance heatmap: {e}")
+
     def compute_means(self) -> Dict[str, float]:
         """
         Compute mean values for all tracked metrics.
@@ -447,7 +680,7 @@ class SpaceshipClassifier(BaseTrainer):
         self.optimizer = self._configure_optimizer()
         self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.scheduler = self._configure_scheduler()
-        self.scaler = GradScaler() if config.mixed_precision and self.device.type == 'cuda' else None
+        self.scaler = GradScaler('cuda') if config.mixed_precision and self.device.type == 'cuda' else None
         
         # Data loaders
         self.train_loader, self.val_loader, self.test_loader = self._create_dataloaders()
@@ -609,13 +842,14 @@ class SpaceshipClassifier(BaseTrainer):
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
                 print(f"Batch [{batch_idx:4d}/{len(self.train_loader)}] | "
-                    f"Loss: {current_metrics.get('loss', 0):.4f} | "
-                    f"Acc: {current_metrics.get('accuracy', 0):5.2f}% | "
-                    f"F1: {current_metrics.get('f1_score', 0):.3f} | "
-                    f"LR: {current_lr:.2e}")
+                      f"Loss: {current_metrics.get('loss', 0):.4f} | "
+                      f"Acc: {current_metrics.get('accuracy', 0):5.2f}% | "
+                      f"F1: {current_metrics.get('f1_score', 0):.3f} | "
+                      f"LR: {current_lr:.2e}")
                 print('-'*80)
                 
         return self.train_metrics.compute()
+    
     def validate_epoch(self, mode: str = "val") -> Dict[str, float]:
         """Run validation/test epoch."""
         if mode == "val":
@@ -906,8 +1140,8 @@ class SpaceshipClassifier(BaseTrainer):
             axes[1, 1].set_yscale('log')
         else:
             axes[1, 1].text(0.5, 0.5, 'Learning Rate\nHistory\nNot Available', 
-                           ha='center', va='center', transform=axes[1, 1].transAxes,
-                           fontsize=12, alpha=0.5)
+                            ha='center', va='center', transform=axes[1, 1].transAxes,
+                            fontsize=12, alpha=0.5)
             axes[1, 1].set_title('Learning Rate')
         axes[1, 1].grid(True, alpha=0.3)
         
@@ -918,6 +1152,7 @@ class SpaceshipClassifier(BaseTrainer):
             print(f"📊 Plot saved: {save_path}")
         
         plt.show()
+
 
 '''
 this is a pipelines to train CWGAN-GP
@@ -976,7 +1211,7 @@ class SpaceshipCWGANGP:
         self._setup_directories()
         self.g_optimizer, self.c_optimizer = self._configure_optimizers()
         self.g_scheduler, self.c_scheduler = self._configure_schedulers()
-        self.scaler = GradScaler() if config.mixed_precision and self.device.type == 'cuda' else None
+        self.scaler = GradScaler('cuda') if config.mixed_precision and self.device.type == 'cuda' else None
         
         # Data loaders
         self.train_dl, self.val_dl, self.test_dl = self._create_dataloaders()
@@ -988,8 +1223,8 @@ class SpaceshipCWGANGP:
         self.history = {}
         
         # Metrics trackers
-        self.train_metrics = MetricsTracker()
-        self.val_metrics = MetricsTracker()
+        self.train_metrics = CWGANGPMetricsTracker(num_classes=self.config.num_classes)
+        self.val_metrics = CWGANGPMetricsTracker(num_classes=self.config.num_classes)
         
         print(f"✅ SpaceshipCWGANGP initialized on {self.device}")
         print(f"📊 Dataset splits: Train={len(self.train_dl.dataset)}, Val={len(self.val_dl.dataset)}")
@@ -1157,17 +1392,17 @@ class SpaceshipCWGANGP:
         
         return gp
 
-    def critic_loss(self, real_imgs: torch.Tensor, fake_imgs: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def critic_loss(self, real_imgs: torch.Tensor, fake_imgs: torch.Tensor, real_labels: torch.Tensor, fake_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute conditional critic loss with gradient penalty."""
         # Critic outputs (conditional on labels)
-        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
-        real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
+        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
+        real_scores = self._critic_to_scalar(self.critic(real_imgs, real_labels))
         
         # Wasserstein distance
         wasserstein_distance = fake_scores.mean() - real_scores.mean()
         
         # Gradient penalty
-        gp = self.gradient_penalty(real_imgs, fake_imgs, labels)
+        gp = self.gradient_penalty(real_imgs, fake_imgs, fake_labels)
         
         # Total critic loss
         c_loss = wasserstein_distance + self.config.lambda_gp * gp
@@ -1212,7 +1447,7 @@ class SpaceshipCWGANGP:
                 
                 # Critic loss with mixed precision
                 with autocast('cuda', enabled=self.scaler is not None):
-                    c_loss, fake_scores, real_scores, gp = self.critic_loss(real_imgs, fake_imgs, real_labels)
+                    c_loss, fake_scores, real_scores, gp = self.critic_loss(real_imgs, fake_imgs, real_labels, fake_labels)
                 
                 # Backward pass for critic
                 if self.scaler:
@@ -1278,7 +1513,7 @@ class SpaceshipCWGANGP:
             avg_gp = np.mean(batch_gps)
             
             self.train_metrics.update(
-                g_loss.item(), avg_c_loss, avg_fake_score, avg_real_score, avg_gp
+                g_loss.item(), avg_c_loss, avg_fake_score, avg_real_score, avg_gp, labels=gen_labels
             )
             
             # Progress logging
@@ -1324,8 +1559,7 @@ class SpaceshipCWGANGP:
                 g_loss = -fake_scores.mean()
                 
                 self.val_metrics.update(
-                    g_loss.item(), c_loss.item(), 
-                    fake_scores.mean().item(), real_scores.mean().item()
+                    g_loss.item(), c_loss.item(), fake_scores.mean().item(), real_scores.mean().item(), labels=fake_labels
                 )
         
         return self.val_metrics.compute_means()
@@ -1511,8 +1745,18 @@ class SpaceshipCWGANGP:
                 self.c_optimizer.load_state_dict(torch.load(c_path, map_location=self.device))
                 print(f"📂 Critic optimizer loaded from {c_path}")
                 
-        except Exception e:
+        except Exception as e:
             print(f"❌ Error loading optimizers: {e}")
+
+    def save_losses(self, loss_dir="losses"):
+        """Save loss history (legacy method)."""
+        try:
+            os.makedirs(loss_dir, exist_ok=True)
+            with open(os.path.join(loss_dir, 'history.json'), 'w') as f:
+                json.dump(self.history, f)
+            print(f"💾 History saved to {loss_dir}")
+        except Exception as e:
+            print(f"❌ Error saving losses: {e}")
 
     def plot_losses(self, history: Dict, kind: str = "training"):
         """Plot training curves with enhanced visualization for conditional GAN."""
@@ -1825,9 +2069,9 @@ class SpaceshipCWGANGP:
             self.plot_losses(self.history, "validating")
         
         # Generate class-specific plots if we have class data
-        self.plot_class_specific_metrics(self.history, "training")
+        self.train_metrics.plot_class_specific_metrics(self.history, kind="training")
         if any('validating' in hist and hist['validating'] for hist in self.history.values()):
-            self.plot_class_specific_metrics(self.history, "validating")
+            self.train_metrics.plot_class_specific_metrics(self.history, kind="validating")
 
         return self.history
 
