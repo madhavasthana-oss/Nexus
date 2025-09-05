@@ -449,9 +449,9 @@ class CWGANGPMetricsTracker:
 
         # Additional plot: Class balance visualization
         if len(epochs) > 5:  # Only create if we have enough data points
-            self._plot_class_balance_heatmap(history, plots_dir, kind)
+            self._plot_class_balance_heatmap(history, kind, plots_dir)
 
-    def _plot_class_balance_heatmap(self, history: Dict,  plots_dir = 'plots_heatmap', kind: str):
+    def _plot_class_balance_heatmap(self, history: Dict, kind: str, plots_dir = 'plots_heatmap'):
         """
         Create a heatmap showing class balance in training metrics.
         
