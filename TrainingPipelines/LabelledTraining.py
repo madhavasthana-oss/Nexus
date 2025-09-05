@@ -208,6 +208,212 @@ class BaseTrainer(ABC):
     def validate_epoch(self, mode: str = "val") -> Dict[str, float]:
         pass
 
+class CWGANGPMetricsTracker:
+    """
+    Metrics tracking class specifically designed for Conditional WGAN-GP training.
+    
+    Tracks all the necessary metrics for conditional adversarial training including
+    generator loss, critic loss, Wasserstein distance, gradient penalty, and
+    class-specific metrics if needed.
+    """
+    
+    def __init__(self, num_classes: Optional[int] = None):
+        """
+        Initialize the metrics tracker.
+        
+        Args:
+            num_classes: Number of classes for class-specific metrics tracking
+        """
+        self.num_classes = num_classes
+        self.reset()
+    
+    def reset(self):
+        """Reset all metrics for a new epoch."""
+        # Core WGAN-GP metrics
+        self.g_losses = []
+        self.c_losses = []
+        self.fake_scores = []
+        self.real_scores = []
+        self.gp_values = []
+        
+        # Derived metrics
+        self.wasserstein_distances = []
+        
+        # Class-specific metrics (if num_classes is provided)
+        if self.num_classes:
+            self.class_g_losses = {i: [] for i in range(self.num_classes)}
+            self.class_c_losses = {i: [] for i in range(self.num_classes)}
+            self.class_fake_scores = {i: [] for i in range(self.num_classes)}
+            self.class_real_scores = {i: [] for i in range(self.num_classes)}
+    
+    def update(self, g_loss: float, c_loss: float, fake_score: float, real_score: float, 
+               gp: Optional[float] = None, labels: Optional[torch.Tensor] = None):
+        """
+        Update metrics with new batch results.
+        
+        Args:
+            g_loss: Generator loss for this batch
+            c_loss: Critic loss for this batch
+            fake_score: Average fake score from critic
+            real_score: Average real score from critic
+            gp: Gradient penalty value (optional, for training only)
+            labels: Labels for class-specific tracking (optional)
+        """
+        # Core metrics
+        self.g_losses.append(g_loss)
+        self.c_losses.append(c_loss)
+        self.fake_scores.append(fake_score)
+        self.real_scores.append(real_score)
+        
+        # Gradient penalty (training only)
+        if gp is not None:
+            self.gp_values.append(gp)
+        
+        # Wasserstein distance
+        wasserstein_dist = fake_score - real_score
+        self.wasserstein_distances.append(wasserstein_dist)
+        
+        # Class-specific metrics
+        if self.num_classes and labels is not None:
+            labels_np = labels.cpu().numpy() if torch.is_tensor(labels) else labels
+            for class_id in range(self.num_classes):
+                class_mask = labels_np == class_id
+                if np.any(class_mask):
+                    # For simplicity, use the same loss for all classes in this batch
+                    # In practice, you might want to compute class-specific losses
+                    self.class_g_losses[class_id].append(g_loss)
+                    self.class_c_losses[class_id].append(c_loss)
+                    self.class_fake_scores[class_id].append(fake_score)
+                    self.class_real_scores[class_id].append(real_score)
+    
+    def compute_means(self) -> Dict[str, float]:
+        """
+        Compute mean values for all tracked metrics.
+        
+        Returns:
+            Dictionary containing mean values for all metrics
+        """
+        metrics = {}
+        
+        # Core metrics
+        if self.g_losses:
+            metrics['g_loss_mean'] = np.mean(self.g_losses)
+            metrics['g_loss_std'] = np.std(self.g_losses)
+        
+        if self.c_losses:
+            metrics['c_loss_mean'] = np.mean(self.c_losses)
+            metrics['c_loss_std'] = np.std(self.c_losses)
+        
+        if self.fake_scores:
+            metrics['fake_score_mean'] = np.mean(self.fake_scores)
+            metrics['fake_score_std'] = np.std(self.fake_scores)
+        
+        if self.real_scores:
+            metrics['real_score_mean'] = np.mean(self.real_scores)
+            metrics['real_score_std'] = np.std(self.real_scores)
+        
+        if self.gp_values:
+            metrics['gp_mean'] = np.mean(self.gp_values)
+            metrics['gp_std'] = np.std(self.gp_values)
+        
+        if self.wasserstein_distances:
+            metrics['wasserstein_distance'] = np.mean(self.wasserstein_distances)
+            metrics['wasserstein_distance_std'] = np.std(self.wasserstein_distances)
+        
+        # Class-specific metrics
+        if self.num_classes:
+            for class_id in range(self.num_classes):
+                if self.class_g_losses[class_id]:
+                    metrics[f'class_{class_id}_g_loss_mean'] = np.mean(self.class_g_losses[class_id])
+                if self.class_c_losses[class_id]:
+                    metrics[f'class_{class_id}_c_loss_mean'] = np.mean(self.class_c_losses[class_id])
+                if self.class_fake_scores[class_id]:
+                    metrics[f'class_{class_id}_fake_score_mean'] = np.mean(self.class_fake_scores[class_id])
+                if self.class_real_scores[class_id]:
+                    metrics[f'class_{class_id}_real_score_mean'] = np.mean(self.class_real_scores[class_id])
+        
+        return metrics
+    
+    def get_current_metrics(self) -> Dict[str, List[float]]:
+        """
+        Get current raw metrics (useful for plotting or detailed analysis).
+        
+        Returns:
+            Dictionary containing all raw metric lists
+        """
+        metrics = {
+            'g_losses': self.g_losses.copy(),
+            'c_losses': self.c_losses.copy(),
+            'fake_scores': self.fake_scores.copy(),
+            'real_scores': self.real_scores.copy(),
+            'gp_values': self.gp_values.copy(),
+            'wasserstein_distances': self.wasserstein_distances.copy(),
+        }
+        
+        if self.num_classes:
+            metrics['class_metrics'] = {
+                'g_losses': self.class_g_losses.copy(),
+                'c_losses': self.class_c_losses.copy(),
+                'fake_scores': self.class_fake_scores.copy(),
+                'real_scores': self.class_real_scores.copy(),
+            }
+        
+        return metrics
+    
+    def print_summary(self, prefix: str = ""):
+        """Print a summary of current metrics."""
+        means = self.compute_means()
+        
+        print(f"{prefix}Metrics Summary:")
+        print(f"{prefix}  Generator Loss: {means.get('g_loss_mean', 0):.4f} ± {means.get('g_loss_std', 0):.4f}")
+        print(f"{prefix}  Critic Loss: {means.get('c_loss_mean', 0):.4f} ± {means.get('c_loss_std', 0):.4f}")
+        print(f"{prefix}  Wasserstein Distance: {means.get('wasserstein_distance', 0):.4f} ± {means.get('wasserstein_distance_std', 0):.4f}")
+        print(f"{prefix}  Fake Score: {means.get('fake_score_mean', 0):.4f} ± {means.get('fake_score_std', 0):.4f}")
+        print(f"{prefix}  Real Score: {means.get('real_score_mean', 0):.4f} ± {means.get('real_score_std', 0):.4f}")
+        
+        if means.get('gp_mean') is not None:
+            print(f"{prefix}  Gradient Penalty: {means.get('gp_mean', 0):.4f} ± {means.get('gp_std', 0):.4f}")
+        
+        # Print class-specific summary if available
+        if self.num_classes:
+            print(f"{prefix}  Class-specific metrics available for {self.num_classes} classes")
+    
+    def get_best_metrics(self, mode: str = 'min') -> Dict[str, float]:
+        """
+        Get best values for each metric.
+        
+        Args:
+            mode: 'min' for minimum values, 'max' for maximum values
+        
+        Returns:
+            Dictionary containing best values
+        """
+        best_metrics = {}
+        func = np.min if mode == 'min' else np.max
+        
+        if self.g_losses:
+            best_metrics['best_g_loss'] = func(self.g_losses)
+        if self.c_losses:
+            best_metrics['best_c_loss'] = func(self.c_losses)
+        if self.fake_scores:
+            best_metrics['best_fake_score'] = func(self.fake_scores)
+        if self.real_scores:
+            best_metrics['best_real_score'] = func(self.real_scores)
+        if self.gp_values:
+            best_metrics['best_gp'] = func(self.gp_values)
+        if self.wasserstein_distances:
+            best_metrics['best_wasserstein_distance'] = func(self.wasserstein_distances)
+        
+        return best_metrics
+    
+    def is_empty(self) -> bool:
+        """Check if any metrics have been recorded."""
+        return len(self.g_losses) == 0
+    
+    def __len__(self) -> int:
+        """Return the number of recorded batches."""
+        return len(self.g_losses)
+
 
 class SpaceshipClassifier(BaseTrainer):
     """
@@ -1617,6 +1823,11 @@ class SpaceshipCWGANGP:
         self.plot_losses(self.history, "training")
         if any('validating' in hist and hist['validating'] for hist in self.history.values()):
             self.plot_losses(self.history, "validating")
+        
+        # Generate class-specific plots if we have class data
+        self.plot_class_specific_metrics(self.history, "training")
+        if any('validating' in hist and hist['validating'] for hist in self.history.values()):
+            self.plot_class_specific_metrics(self.history, "validating")
 
         return self.history
 
@@ -1717,4 +1928,3 @@ class SpaceshipCWGANGP:
         except Exception as e:
             print(f"❌ Error generating label-conditioned samples: {e}")
             return None
-        
