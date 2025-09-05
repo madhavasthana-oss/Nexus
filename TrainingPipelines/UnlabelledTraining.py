@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 
 @dataclass
-class TrainingConfig:
+class TrainingConfig_WGANGP:
     """Configuration for WGAN-GP training parameters."""
     # Core training params
     num_epochs: int = 50
@@ -164,7 +164,7 @@ class SpaceshipWGANGP:
     - Automatic image generation and saving
     """
 
-    def __init__(self, generator, critic, dataset, config: TrainingConfig):
+    def __init__(self, generator, critic, dataset, config: TrainingConfig_WGANGP):
         """
         Initialize the WGAN-GP trainer.
         
