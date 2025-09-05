@@ -108,7 +108,7 @@ class TrainingConfig_CWGANGP:
 
     # Training parameters
     num_classes: int = 10
-    latent_dim: int = 128
+    latent_dim: int = 100
     noise_dim: Tuple[int, ...] = (1, 1)
 
     # Generation
