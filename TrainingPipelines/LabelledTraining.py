@@ -18,7 +18,7 @@ import torchvision
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torch import amp
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import wandb
 
@@ -84,89 +84,64 @@ class TrainingConfig_Classifier:
 @dataclass
 class TrainingConfig_CWGANGP:
     """Configuration for training parameters."""
-     # Core training params
-    num_epochs: int = 50
-    batch_size: int = 32
-    g_lr: float = 1e-4
-    c_lr: float = 2e-4
+    num_epochs: int = 100
+    batch_size: int = 256
+    g_lr: float = 2e-4
+    c_lr: float - 1e-4
     g_betas: Tuple[float, float] = (0.0, 0.9)
     c_betas: Tuple[float, float] = (0.0, 0.9)
+    g_weight_decay: float = 1e-4
+    c_weight_decay: float = 1e-4
     device: str = 'cuda'
-    
-    # WGAN-GP specific
-    lambda_gp: float = 10.0
-    n_critic: int = 5
-    latent_dim: int = 100
-    noise_dim: Tuple[int, ...] = (1, 1)
-    img_shape: Tuple[int, ...] = (1, 28, 28)
-    
-    # Dataset handling
-    ratios: Tuple[float, ...] = (0.8, 0.1, 0.1)
-    is_labelled: bool = True
+    ratios: Tuple[float, ...] = (0.8, 0.15, 0.05)
     num_workers: int = 4
     pin_memory: bool = True
     
     # Training options
     mixed_precision: bool = True
     gradient_clip_norm: Optional[float] = 1.0
+    accumulation_steps: int = 1
     
-    # Early stopping & validation
-    patience: int = 10
+    # Early stopping
+    patience: int = 7
     min_delta: float = 1e-4
     validate_per_epoch: int = 1
+    display_per_batch: int = 5
+    # Scheduler
+    scheduler_type: str = "reduce_on_plateau"  # "reduce_on_plateau", "cosine", "step", "none"
+    scheduler_params: Dict[str, Any] = field(default_factory=lambda: {
+        "reduce_on_plateau": {"factor": 0.5, "patience": 3, "min_lr": 1e-7},
+        "cosine": {"T_max": 50, "eta_min": 1e-6},
+        "step": {"step_size": 15, "gamma": 0.1}
+    })
     
-    # Scheduler options
-    g_scheduler_type: str = "none"  # "reduce_on_plateau", "cosine", "step", "none"
-    c_scheduler_type: str = "none"
-    scheduler_factor: float = 0.5
-    scheduler_patience: int = 5
-    scheduler_min_lr: float = 1e-7
-    scheduler_t_max: int = 50
-    scheduler_eta_min: float = 1e-7
-    scheduler_step_size: int = 30
-    scheduler_gamma: float = 0.5
-    
-    # Paths and saving
-    model_dir: str = "model_weights"
+    # Paths
+    generator_dir: str = "generator checkpoints"
+    critic_dir: str = "critic checkpoints"
     logs_dir: str = "logs"
     plots_dir: str = "plots"
-    gen_out_dir: str = "generated_pics"
+    
+    # Logging
+    wandb_project: Optional[str] = "spaceship-CWGAN-GP"
     save_best_only: bool = True
     save_last: bool = True
-    gen_save_name: str = "generator"
-    critic_save_name: str = "critic"
-    
-    # Logging and monitoring
-    wandb_project: Optional[str] = "wgan-gp-run"
-    use_wandb: bool = True
-    display_per_batch: int = 10
-    clear_cache_every_n_batches: int = 0
-    
-    # Image generation
-    num_pictures: int = 16
-    num_rows: int = 4
-    save_images_every_epoch: bool = True
     
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.num_epochs <= 0:
             raise ValueError("num_epochs must be positive")
-        if self.g_lr <= 0 or self.c_lr <= 0:
-            raise ValueError("learning rates must be positive")
+        if not 0 < self.lr < 1:
+            raise ValueError("lr must be between 0 and 1")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if len(self.ratios) > 3 or len(self.ratios) < 2:
-            raise ValueError("ratios must be be a proper tuple")
-        if self.lambda_gp < 0:
-            raise ValueError("lambda_gp must be non-negative")
-        if self.n_critic <= 0:
-            raise ValueError("n_critic must be positive")
-        if self.latent_dim <= 0:
-            raise ValueError("latent_dim must be positive")
-        
-        # Convert noise_dim to tuple if it's an int
-        if isinstance(self.noise_dim, int):
-            self.noise_dim = (self.noise_dim,)
+        if len(self.ratios) not in [2, 3]:
+            raise ValueError("ratios must have 2 or 3 elements")
+        if not np.isclose(sum(self.ratios), 1.0, atol=1e-3):
+            raise ValueError("ratios must sum to 1.0")
+        if self.scheduler_type not in ["reduce_on_plateau", "cosine", "step", "none"]:
+            raise ValueError(f"Invalid scheduler_type: {self.scheduler_type}")
+
+
 
 
 class MetricsTracker:
@@ -222,77 +197,6 @@ class MetricsTracker:
         return classification_report(self.targets, self.predictions)
 
 
-class CWGANGPMetricsTracker:
-    """Track and compute WGAN-GP specific metrics during training."""
-    
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        """Reset all tracked metrics."""
-        self.g_losses = []
-        self.c_losses = []
-        self.fake_scores = []
-        self.real_scores = []
-        self.gp_values = []
-        self.batch_count = 0
-    
-    def update(self, g_loss: float, c_loss: float, fake_score: float, real_score: float, gp: Optional[float] = None):
-        """
-        Update metrics with new batch data.
-        
-        Args:
-            g_loss: Generator loss value
-            c_loss: Critic loss value  
-            fake_score: Mean critic score for fake images
-            real_score: Mean critic score for real images
-            gp: Gradient penalty value (optional, for training only)
-        """
-        self.g_losses.append(g_loss)
-        self.c_losses.append(c_loss)
-        self.fake_scores.append(fake_score)
-        self.real_scores.append(real_score)
-        if gp is not None:
-            self.gp_values.append(gp)
-        self.batch_count += 1
-    
-    def compute_means(self) -> Dict[str, float]:
-        """Compute mean values for all tracked metrics."""
-        if self.batch_count == 0:
-            return {}
-        
-        metrics = {
-            'g_loss_mean': np.mean(self.g_losses),
-            'c_loss_mean': np.mean(self.c_losses),
-            'fake_score_mean': np.mean(self.fake_scores),
-            'real_score_mean': np.mean(self.real_scores),
-            'wasserstein_distance': np.mean(self.fake_scores) - np.mean(self.real_scores),
-            'batch_count': self.batch_count
-        }
-        
-        if self.gp_values:
-            metrics['gp_mean'] = np.mean(self.gp_values)
-        
-        return metrics
-    
-    def get_latest_values(self) -> Dict[str, float]:
-        """Get the most recent metric values."""
-        if self.batch_count == 0:
-            return {}
-        
-        latest = {
-            'g_loss_latest': self.g_losses[-1] if self.g_losses else 0.0,
-            'c_loss_latest': self.c_losses[-1] if self.c_losses else 0.0,
-            'fake_score_latest': self.fake_scores[-1] if self.fake_scores else 0.0,
-            'real_score_latest': self.real_scores[-1] if self.real_scores else 0.0,
-        }
-        
-        if self.gp_values:
-            latest['gp_latest'] = self.gp_values[-1]
-            
-        return latest
-
-
 class BaseTrainer(ABC):
     """Abstract base trainer class."""
     
@@ -337,7 +241,7 @@ class SpaceshipClassifier(BaseTrainer):
         self.optimizer = self._configure_optimizer()
         self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.scheduler = self._configure_scheduler()
-        self.scaler = GradScaler('cuda') if config.mixed_precision and self.device.type == 'cuda' else None
+        self.scaler = GradScaler() if config.mixed_precision and self.device.type == 'cuda' else None
         
         # Data loaders
         self.train_loader, self.val_loader, self.test_loader = self._create_dataloaders()
@@ -352,8 +256,8 @@ class SpaceshipClassifier(BaseTrainer):
         self.train_metrics = MetricsTracker()
         self.val_metrics = MetricsTracker()
         
-        print(f"Initialized SpaceshipClassifier on {self.device}")
-        print(f"Dataset splits: {len(self.train_loader.dataset)}/{len(self.val_loader.dataset)}" + 
+        print(f"✅ Initialized SpaceshipClassifier on {self.device}")
+        print(f"📊 Dataset splits: {len(self.train_loader.dataset)}/{len(self.val_loader.dataset)}" + 
               (f"/{len(self.test_loader.dataset)}" if self.test_loader else ""))
     
     def _setup_directories(self):
@@ -506,7 +410,6 @@ class SpaceshipClassifier(BaseTrainer):
                 print('-'*80)
                 
         return self.train_metrics.compute()
-    
     def validate_epoch(self, mode: str = "val") -> Dict[str, float]:
         """Run validation/test epoch."""
         if mode == "val":
@@ -578,7 +481,7 @@ class SpaceshipClassifier(BaseTrainer):
         if is_best:
             best_path = filepath.replace('.pth', '_best.pth')
             torch.save(checkpoint, best_path)
-            print(f"Best model saved: {best_path}")
+            print(f"💾 Best model saved: {best_path}")
     
     def load_checkpoint(self, filepath: str) -> Dict:
         """Load model checkpoint."""
@@ -600,12 +503,12 @@ class SpaceshipClassifier(BaseTrainer):
         self.best_val_loss = checkpoint['best_val_loss']
         self.history = checkpoint.get('history', {'train': [], 'val': [], 'test': []})
         
-        print(f"Checkpoint loaded: {filepath} (epoch {self.current_epoch})")
+        print(f"📂 Checkpoint loaded: {filepath} (epoch {self.current_epoch})")
         return checkpoint
     
     def fit(self) -> Dict:
         """Main training loop with all the bells and whistles."""
-        print("Starting training...")
+        print("🚀 Starting training...")
         
         # Initialize wandb
         if self.config.wandb_project:
@@ -615,9 +518,9 @@ class SpaceshipClassifier(BaseTrainer):
                     config=self.config.__dict__,
                     reinit=True
                 )
-                print("W&B initialized successfully")
+                print("📊 W&B initialized successfully")
             except Exception as e:
-                print(f"W&B initialization failed: {e}")
+                print(f"⚠️  W&B initialization failed: {e}")
                 wandb = None
         
         start_time = time.time()
@@ -628,7 +531,7 @@ class SpaceshipClassifier(BaseTrainer):
                 epoch_start = time.time()
                 
                 print(f"\n{'='*80}")
-                print(f"\t\t\tEPOCH {epoch+1}/{self.config.num_epochs}")
+                print(f"\t\t\t\t🌟 EPOCH {epoch+1}/{self.config.num_epochs}")
                 print(f"{'='*80}")
                 
                 # Training
@@ -647,13 +550,13 @@ class SpaceshipClassifier(BaseTrainer):
                 epoch_time = time.time() - epoch_start
                 lr = self.optimizer.param_groups[0]['lr']
                 
-                print(f"Epoch time: {epoch_time:.2f}s | LR: {lr:.2e}")
-                print(f"Train - Loss: {train_metrics.get('loss', 0):.4f} | "
+                print(f"⏱️  Epoch time: {epoch_time:.2f}s | LR: {lr:.2e}")
+                print(f"🔥 Train - Loss: {train_metrics.get('loss', 0):.4f} | "
                       f"Acc: {train_metrics.get('accuracy', 0):.2f}% | "
                       f"F1: {train_metrics.get('f1_score', 0):.3f}")
                 
                 if val_metrics:
-                    print(f"Val   - Loss: {val_metrics.get('loss', 0):.4f} | "
+                    print(f"✅ Val   - Loss: {val_metrics.get('loss', 0):.4f} | "
                           f"Acc: {val_metrics.get('accuracy', 0):.2f}% | "
                           f"F1: {val_metrics.get('f1_score', 0):.3f}")
                 
@@ -668,9 +571,9 @@ class SpaceshipClassifier(BaseTrainer):
                     self.save_checkpoint(str(checkpoint_path))
                 
                 if should_save:
-                    print("New best model!")
+                    print("🎯 New best model!")
                 else:
-                    print(f"Patience: {self.patience_counter}/{self.config.patience}")
+                    print(f"⏳ Patience: {self.patience_counter}/{self.config.patience}")
                 
                 # Update scheduler
                 self._update_scheduler(val_metrics)
@@ -688,19 +591,19 @@ class SpaceshipClassifier(BaseTrainer):
                 
                 # Early stopping
                 if self.patience_counter >= self.config.patience:
-                    print(f"\nEarly stopping triggered! No improvement for {self.config.patience} epochs")
+                    print(f"\n🛑 Early stopping triggered! No improvement for {self.config.patience} epochs")
                     break
         
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user")
+            print("\n⚠️  Training interrupted by user")
         
         except Exception as e:
-            print(f"\nTraining failed: {e}")
+            print(f"\n❌ Training failed: {e}")
             raise
         
         finally:
             total_time = time.time() - start_time
-            print(f"\nTraining completed in {total_time/60:.2f} minutes")
+            print(f"\n🏁 Training completed in {total_time/60:.2f} minutes")
             
             if wandb is not None:
                 wandb.finish()
@@ -710,14 +613,14 @@ class SpaceshipClassifier(BaseTrainer):
     def test(self) -> Optional[Dict[str, float]]:
         """Evaluate on test set with detailed metrics."""
         if not self.test_loader:
-            print("No test set available")
+            print("❌ No test set available")
             return None
         
-        print("Running test evaluation...")
+        print("🧪 Running test evaluation...")
         test_metrics = self.validate_epoch("test")
         
         if test_metrics:
-            print(f"\nTEST RESULTS:")
+            print(f"\n📊 TEST RESULTS:")
             print(f"Loss: {test_metrics['loss']:.4f}")
             print(f"Accuracy: {test_metrics['accuracy']:.2f}%")
             print(f"Precision: {test_metrics['precision']:.3f}")
@@ -735,7 +638,7 @@ class SpaceshipClassifier(BaseTrainer):
                     preds = torch.argmax(logits, dim=1)
                     test_tracker.update(preds, y, 0)  # Loss not needed here
             
-            print(f"\nClassification Report:")
+            print(f"\n📈 Classification Report:")
             print(test_tracker.get_classification_report())
         
         return test_metrics
@@ -743,7 +646,7 @@ class SpaceshipClassifier(BaseTrainer):
     def plot_training_history(self, save_path: Optional[str] = None):
         """Create comprehensive training plots."""
         if not self.history['train']:
-            print("No training history to plot")
+            print("❌ No training history to plot")
             return
         
         # Prepare data
@@ -789,38 +692,47 @@ class SpaceshipClassifier(BaseTrainer):
         axes[1, 0].grid(True, alpha=0.3)
         
         # Learning rate plot (if available)
-        lr_history = [self.optimizer.param_groups[0]['lr']] * len(train_data)  # Placeholder for LR history
         if hasattr(self, 'lr_history') and self.lr_history:
             axes[1, 1].plot(epochs, self.lr_history, 'g-', linewidth=2)
+            axes[1, 1].set_title('Learning Rate')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Learning Rate')
+            axes[1, 1].set_yscale('log')
         else:
-            axes[1, 1].plot(epochs, lr_history, 'g-', linewidth=2)
-        axes[1, 1].set_title('Learning Rate')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Learning Rate')
-        axes[1, 1].set_yscale('log')
+            axes[1, 1].text(0.5, 0.5, 'Learning Rate\nHistory\nNot Available', 
+                           ha='center', va='center', transform=axes[1, 1].transAxes,
+                           fontsize=12, alpha=0.5)
+            axes[1, 1].set_title('Learning Rate')
         axes[1, 1].grid(True, alpha=0.3)
         
         plt.tight_layout()
         
-        # Save plot if path provided
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Plot saved: {save_path}")
-        else:
-            plot_path = Path(self.config.plots_dir) / "training_history.png"
-            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-            print(f"Plot saved: {plot_path}")
+            print(f"📊 Plot saved: {save_path}")
         
         plt.show()
-        plt.close()
 
+'''
+this is a pipelines to train CWGAN-GP
+the only difference in the critic and generator in this workflow is that 
+both the generator and the critic take in labels as well.
 
+the main idea is that 
+    ->generator 
+        =>input--(noise vector, label) -> image
+    ->critic
+        =>has to predict the image along with the labels
+            so input--(imgs, label) -> currency (1 or 0)
+        
+'''
 class SpaceshipCWGANGP:
     """
-    Enhanced C-WGAN-GP implementation with modern training practices and TrainingConfig.
+    Enhanced Conditional WGAN-GP implementation with modern training practices and TrainingConfig.
     
     Features:
     - Clean configuration system with TrainingConfig
+    - Conditional generation with label embeddings
     - Mixed precision training for faster performance
     - Advanced learning rate scheduling for both G and C
     - Comprehensive metrics tracking and logging
@@ -828,17 +740,18 @@ class SpaceshipCWGANGP:
     - Better error handling and validation
     - W&B integration with rich logging
     - Automatic image generation and saving
+    - Label-conditioned training and validation
     """
 
     def __init__(self, generator, critic, dataset, config: TrainingConfig_CWGANGP):
         """
-        Initialize the WGAN-GP trainer.
+        Initialize the Conditional WGAN-GP trainer.
         
         Args:
-            generator: Generator model
-            critic: Critic (discriminator) model  
-            dataset: Full dataset to be split
-            config: WGAN-GP training configuration
+            generator: Conditional Generator model (takes noise + labels)
+            critic: Conditional Critic model (takes images + labels)
+            dataset: Full dataset to be split (must return (image, label) tuples)
+            config: Conditional WGAN-GP training configuration
         """
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
@@ -848,14 +761,19 @@ class SpaceshipCWGANGP:
         self.critic = critic.to(self.device)
         self.dataset = dataset
         
+        # Validate that we have num_classes
+        if not hasattr(config, 'num_classes'):
+            raise ValueError("TrainingConfig_CWGANGP must specify num_classes")
+        self.num_classes = config.num_classes
+        
         # Initialize training components
         self._setup_directories()
         self.g_optimizer, self.c_optimizer = self._configure_optimizers()
         self.g_scheduler, self.c_scheduler = self._configure_schedulers()
-        self.scaler = GradScaler('cuda') if config.mixed_precision and self.device.type == 'cuda' else None
+        self.scaler = GradScaler() if config.mixed_precision and self.device.type == 'cuda' else None
         
         # Data loaders
-        self.train_dl, self.val_dl, self.test_dl= self._create_dataloaders()
+        self.train_dl, self.val_dl, self.test_dl = self._create_dataloaders()
         
         # Training state
         self.current_epoch = 0
@@ -863,14 +781,15 @@ class SpaceshipCWGANGP:
         self.patience_counter = 0
         self.history = {}
         
-        # Metrics trackers - Using the new CWGAN-GP specific tracker
-        self.train_metrics = CWGANGPMetricsTracker()
-        self.val_metrics = CWGANGPMetricsTracker()
+        # Metrics trackers
+        self.train_metrics = MetricsTracker()
+        self.val_metrics = MetricsTracker()
         
-        print(f"SpaceshipCWGANGP initialized on {self.device}")
-        print(f"Dataset splits: Train={len(self.train_dl.dataset)}, Val={len(self.val_dl.dataset)}")
-        print(f"Generator LR: {config.g_lr}, Critic LR: {config.c_lr}")
-        print(f"Mixed Precision: {config.mixed_precision}, Lambda GP: {config.lambda_gp}")
+        print(f"✅ SpaceshipCWGANGP initialized on {self.device}")
+        print(f"📊 Dataset splits: Train={len(self.train_dl.dataset)}, Val={len(self.val_dl.dataset)}")
+        print(f"🎮 Generator LR: {config.g_lr}, Critic LR: {config.c_lr}")
+        print(f"🏷️  Number of classes: {self.num_classes}")
+        print(f"🔧 Mixed Precision: {config.mixed_precision}, Lambda GP: {config.lambda_gp}")
 
     def _setup_directories(self):
         """Create necessary directories."""
@@ -985,6 +904,10 @@ class SpaceshipCWGANGP:
             *self.config.noise_dim, 
             device=self.device
         )
+    
+    def _sample_labels(self, batch_size: int) -> torch.Tensor:
+        """Generate random labels for conditional generation."""
+        return torch.randint(0, self.num_classes, (batch_size,), device=self.device)
 
     def _critic_to_scalar(self, critic_out: torch.Tensor) -> torch.Tensor:
         """
@@ -996,8 +919,8 @@ class SpaceshipCWGANGP:
         # Reduce spatial dimensions if they exist
         return critic_out.view(critic_out.size(0), -1).mean(dim=1)
 
-    def gradient_penalty(self, labels, real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> torch.Tensor:
-        """Compute gradient penalty for CWGAN-GP."""
+    def gradient_penalty(self, real_imgs: torch.Tensor, fake_imgs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute gradient penalty for Conditional WGAN-GP."""
         batch_size = real_imgs.size(0)
         
         # Random interpolation factor
@@ -1006,7 +929,7 @@ class SpaceshipCWGANGP:
         # Interpolated images
         interpolated = (alpha * real_imgs + (1 - alpha) * fake_imgs).requires_grad_(True)
         
-        # Critic output for interpolated images
+        # Critic output for interpolated images (with labels)
         c_interpolated = self.critic(interpolated, labels)
         c_interpolated = self._critic_to_scalar(c_interpolated)
         
@@ -1028,30 +951,26 @@ class SpaceshipCWGANGP:
         
         return gp
 
-    def critic_loss(self, labels, real_imgs: torch.Tensor, fake_imgs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute critic loss with gradient penalty."""
-        # Generate fake labels (zeros) for fake images
-        fake_labels = torch.zeros_like(labels, device=self.device)
-        
-        # Critic outputs
-        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
+    def critic_loss(self, real_imgs: torch.Tensor, fake_imgs: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute conditional critic loss with gradient penalty."""
+        # Critic outputs (conditional on labels)
+        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
         real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
         
         # Wasserstein distance
         wasserstein_distance = fake_scores.mean() - real_scores.mean()
         
         # Gradient penalty
-        gp = self.gradient_penalty(labels, real_imgs, fake_imgs)
+        gp = self.gradient_penalty(real_imgs, fake_imgs, labels)
         
         # Total critic loss
         c_loss = wasserstein_distance + self.config.lambda_gp * gp
         
         return c_loss, fake_scores, real_scores, gp
 
-    def generator_loss(self, labels, fake_imgs: torch.Tensor) -> torch.Tensor:
-        """Compute generator loss."""
-        fake_labels = torch.zeros_like(labels, device=self.device)
-        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
+    def generator_loss(self, fake_imgs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute conditional generator loss."""
+        fake_scores = self._critic_to_scalar(self.critic(fake_imgs, labels))
         return -fake_scores.mean()
 
     def train_epoch(self) -> Dict[str, float]:
@@ -1062,10 +981,10 @@ class SpaceshipCWGANGP:
         
         total_batches = len(self.train_dl)
         
-        for batch_idx, (real_imgs, labels) in enumerate(self.train_dl):
-            
+        for batch_idx, (real_imgs, real_labels) in enumerate(self.train_dl):
+            # Move data to device
             real_imgs = real_imgs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
+            real_labels = real_labels.to(self.device, non_blocking=True)
             batch_size = real_imgs.size(0)
             
             # Train Critic n_critic times
@@ -1077,14 +996,17 @@ class SpaceshipCWGANGP:
             for _ in range(self.config.n_critic):
                 self.c_optimizer.zero_grad()
                 
-                # Generate fake images
+                # Generate fake images with labels
                 z = self._sample_noise(batch_size)
+                # Use real labels for training (could also use random labels)
+                fake_labels = real_labels if self.config.use_real_labels_for_fake else self._sample_labels(batch_size)
+                
                 with torch.no_grad():
-                    fake_imgs = self.generator(z, labels)
+                    fake_imgs = self.generator(z, fake_labels)
                 
                 # Critic loss with mixed precision
                 with autocast('cuda', enabled=self.scaler is not None):
-                    c_loss, fake_scores, real_scores, gp = self.critic_loss(labels, real_imgs, fake_imgs)
+                    c_loss, fake_scores, real_scores, gp = self.critic_loss(real_imgs, fake_imgs, real_labels)
                 
                 # Backward pass for critic
                 if self.scaler:
@@ -1116,11 +1038,12 @@ class SpaceshipCWGANGP:
             self.g_optimizer.zero_grad()
             
             z = self._sample_noise(batch_size)
-            fake_imgs = self.generator(z, labels)
+            gen_labels = real_labels if self.config.use_real_labels_for_fake else self._sample_labels(batch_size)
+            fake_imgs = self.generator(z, gen_labels)
             
             # Generator loss with mixed precision
             with autocast('cuda', enabled=self.scaler is not None):
-                g_loss = self.generator_loss(labels, fake_imgs)
+                g_loss = self.generator_loss(fake_imgs, gen_labels)
             
             # Backward pass for generator
             if self.scaler:
@@ -1142,18 +1065,14 @@ class SpaceshipCWGANGP:
                     )
                 self.g_optimizer.step()
             
-            # Update training metrics using the new method signature
+            # Update training metrics
             avg_c_loss = np.mean(batch_c_losses)
             avg_fake_score = np.mean(batch_fake_scores)
             avg_real_score = np.mean(batch_real_scores)
             avg_gp = np.mean(batch_gps)
             
             self.train_metrics.update(
-                g_loss.item(), 
-                avg_c_loss, 
-                avg_fake_score, 
-                avg_real_score, 
-                avg_gp
+                g_loss.item(), avg_c_loss, avg_fake_score, avg_real_score, avg_gp
             )
             
             # Progress logging
@@ -1180,45 +1099,57 @@ class SpaceshipCWGANGP:
         self.val_metrics.reset()
         
         with torch.no_grad():
-            for batch_idx, (real_imgs, labels) in enumerate(self.val_dl):
-                
+            for real_imgs, real_labels in self.val_dl:
+                # Move data to device
                 real_imgs = real_imgs.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
+                real_labels = real_labels.to(self.device, non_blocking=True)
                 batch_size = real_imgs.size(0)
                 
                 # Generate fake images
                 z = self._sample_noise(batch_size)
-                fake_imgs = self.generator(z, labels)
-                
-                # Generate fake labels for validation
-                fake_labels = torch.zeros_like(labels, device=self.device)
+                fake_labels = real_labels if self.config.use_real_labels_for_fake else self._sample_labels(batch_size)
+                fake_imgs = self.generator(z, fake_labels)
                 
                 # Compute losses (no gradient penalty in validation)
                 fake_scores = self._critic_to_scalar(self.critic(fake_imgs, fake_labels))
-                real_scores = self._critic_to_scalar(self.critic(real_imgs, labels))
+                real_scores = self._critic_to_scalar(self.critic(real_imgs, real_labels))
                 
                 c_loss = fake_scores.mean() - real_scores.mean()
                 g_loss = -fake_scores.mean()
                 
-                # Update validation metrics (no GP in validation)
                 self.val_metrics.update(
-                    g_loss.item(), 
-                    c_loss.item(), 
-                    fake_scores.mean().item(), 
-                    real_scores.mean().item()
+                    g_loss.item(), c_loss.item(), 
+                    fake_scores.mean().item(), real_scores.mean().item()
                 )
         
         return self.val_metrics.compute_means()
 
-    def generate_images(self, epoch: int):
-        """Generate and save sample images."""
+    def generate_images(self, epoch: int, specific_labels: Optional[torch.Tensor] = None):
+        """Generate and save sample images, optionally for specific labels."""
         try:
             self.generator.eval()
             with torch.no_grad():
                 z = self._sample_noise(self.config.num_pictures)
-                # Generate random labels for image generation
-                random_labels = torch.randint(0, 10, (self.config.num_pictures,), device=self.device)
-                fake_imgs = self.generator(z, random_labels).cpu()
+                
+                if specific_labels is not None:
+                    # Use provided labels
+                    labels = specific_labels.to(self.device)
+                else:
+                    # Generate balanced samples from all classes
+                    samples_per_class = max(1, self.config.num_pictures // self.num_classes)
+                    labels = []
+                    for class_id in range(self.num_classes):
+                        labels.extend([class_id] * samples_per_class)
+                    
+                    # Fill remaining slots if needed
+                    while len(labels) < self.config.num_pictures:
+                        labels.append(torch.randint(0, self.num_classes, (1,)).item())
+                    
+                    # Truncate if we have too many
+                    labels = labels[:self.config.num_pictures]
+                    labels = torch.tensor(labels, device=self.device)
+                
+                fake_imgs = self.generator(z, labels).cpu()
                 # Normalize to [0, 1]
                 fake_imgs = (fake_imgs + 1) / 2.0
                 fake_imgs = torch.clamp(fake_imgs, 0, 1)
@@ -1228,11 +1159,22 @@ class SpaceshipCWGANGP:
             save_path = Path(self.config.gen_out_dir) / f'generated_epoch_{epoch}.png'
             torchvision.utils.save_image(img_grid, save_path)
             
+            # Also save class-specific grids if we have labels
+            if hasattr(self, 'class_names') or self.num_classes <= 10:
+                for class_id in range(min(self.num_classes, 10)):  # Limit to 10 classes for visualization
+                    class_mask = (labels == class_id)
+                    if class_mask.sum() > 0:
+                        class_imgs = fake_imgs[class_mask]
+                        if len(class_imgs) > 0:
+                            class_grid = torchvision.utils.make_grid(class_imgs, nrow=min(8, len(class_imgs)))
+                            class_path = Path(self.config.gen_out_dir) / f'class_{class_id}_epoch_{epoch}.png'
+                            torchvision.utils.save_image(class_grid, class_path)
+            
             self.generator.train()
-            print(f"Images saved: {save_path}")
+            print(f"🖼️  Images saved: {save_path}")
             
         except Exception as e:
-            print(f"Error generating images: {e}")
+            print(f"❌ Error generating images: {e}")
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint with comprehensive state."""
@@ -1249,6 +1191,7 @@ class SpaceshipCWGANGP:
                 'best_g_val_loss': self.best_g_val_loss,
                 'config': self.config,
                 'history': self.history,
+                'num_classes': self.num_classes,
             }
             
             # Save regular checkpoint
@@ -1259,12 +1202,12 @@ class SpaceshipCWGANGP:
             if is_best:
                 best_path = Path(self.config.model_dir) / "best_checkpoint.pth"
                 torch.save(checkpoint, best_path)
-                print(f"Best checkpoint saved: {best_path}")
+                print(f"💾 Best checkpoint saved: {best_path}")
             
-            print(f"Checkpoint saved: {checkpoint_path}")
+            print(f"💾 Checkpoint saved: {checkpoint_path}")
             
         except Exception as e:
-            print(f"Error saving checkpoint: {e}")
+            print(f"❌ Error saving checkpoint: {e}")
 
     def load_checkpoint(self, checkpoint_path: str) -> Dict:
         """Load model checkpoint."""
@@ -1294,12 +1237,13 @@ class SpaceshipCWGANGP:
             self.current_epoch = checkpoint['epoch']
             self.best_g_val_loss = checkpoint.get('best_g_val_loss', float('inf'))
             self.history = checkpoint.get('history', {})
+            self.num_classes = checkpoint.get('num_classes', self.num_classes)
             
-            print(f"Checkpoint loaded: {checkpoint_path} (epoch {self.current_epoch})")
+            print(f"📂 Checkpoint loaded: {checkpoint_path} (epoch {self.current_epoch})")
             return checkpoint
             
         except Exception as e:
-            print(f"Error loading checkpoint: {e}")
+            print(f"❌ Error loading checkpoint: {e}")
             raise
 
     # Legacy methods for backward compatibility
@@ -1313,9 +1257,9 @@ class SpaceshipCWGANGP:
             os.makedirs(weight_dir, exist_ok=True)
             torch.save(self.generator.state_dict(), os.path.join(weight_dir, generator_name))
             torch.save(self.critic.state_dict(), os.path.join(weight_dir, critic_name))
-            print(f"Models saved to {weight_dir}")
+            print(f"💾 Models saved to {weight_dir}")
         except Exception as e:
-            print(f"Error saving weights: {e}")
+            print(f"❌ Error saving weights: {e}")
 
     def load_weights(self, weight_dir=None, generator_name=None, critic_name=None):
         """Load model weights (legacy method)."""
@@ -1329,14 +1273,14 @@ class SpaceshipCWGANGP:
             
             if os.path.exists(gen_path):
                 self.generator.load_state_dict(torch.load(gen_path, map_location=self.device))
-                print(f"Generator loaded from {gen_path}")
+                print(f"📂 Generator loaded from {gen_path}")
             
             if os.path.exists(critic_path):
                 self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
-                print(f"Critic loaded from {critic_path}")
+                print(f"📂 Critic loaded from {critic_path}")
                 
         except Exception as e:
-            print(f"Error loading weights: {e}")
+            print(f"❌ Error loading weights: {e}")
 
     def save_optimizers(self, opt_dir="optimizers"):
         """Save optimizer states (legacy method)."""
@@ -1344,9 +1288,9 @@ class SpaceshipCWGANGP:
             os.makedirs(opt_dir, exist_ok=True)
             torch.save(self.g_optimizer.state_dict(), os.path.join(opt_dir, 'g_optimizer.pth'))
             torch.save(self.c_optimizer.state_dict(), os.path.join(opt_dir, 'c_optimizer.pth'))
-            print(f"Optimizers saved to {opt_dir}")
+            print(f"💾 Optimizers saved to {opt_dir}")
         except Exception as e:
-            print(f"Error saving optimizers: {e}")
+            print(f"❌ Error saving optimizers: {e}")
 
     def load_optimizers(self, opt_dir="optimizers"):
         """Load optimizer states (legacy method)."""
@@ -1356,18 +1300,18 @@ class SpaceshipCWGANGP:
             
             if os.path.exists(g_path):
                 self.g_optimizer.load_state_dict(torch.load(g_path, map_location=self.device))
-                print(f"Generator optimizer loaded from {g_path}")
+                print(f"📂 Generator optimizer loaded from {g_path}")
             if os.path.exists(c_path):
                 self.c_optimizer.load_state_dict(torch.load(c_path, map_location=self.device))
-                print(f"Critic optimizer loaded from {c_path}")
+                print(f"📂 Critic optimizer loaded from {c_path}")
                 
-        except Exception as e:
-            print(f"Error loading optimizers: {e}")
+        except Exception e:
+            print(f"❌ Error loading optimizers: {e}")
 
     def plot_losses(self, history: Dict, kind: str = "training"):
-        """Plot training curves with enhanced visualization."""
+        """Plot training curves with enhanced visualization for conditional GAN."""
         if not history:
-            print("No history to plot")
+            print("❌ No history to plot")
             return
 
         g_losses, c_losses, wasserstein_distances = [], [], []
@@ -1393,12 +1337,12 @@ class SpaceshipCWGANGP:
             gp_values.append(metrics.get('gp_mean', 0))
 
         if not g_losses:
-            print(f"No {kind} data to plot")
+            print(f"❌ No {kind} data to plot")
             return
 
         # Create comprehensive plot
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-        fig.suptitle(f'WGAN-GP {kind.capitalize()} Metrics', fontsize=16, fontweight='bold')
+        fig.suptitle(f'Conditional WGAN-GP {kind.capitalize()} Metrics', fontsize=16, fontweight='bold')
 
         # Generator and Critic Losses
         axes[0, 0].plot(epochs, g_losses, 'b-', label='Generator', linewidth=2, marker='o')
@@ -1413,7 +1357,7 @@ class SpaceshipCWGANGP:
         axes[0, 1].plot(epochs, wasserstein_distances, 'g-', linewidth=2, marker='o')
         axes[0, 1].set_title('Wasserstein Distance')
         axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Wasserstein Distance')
+        axes[0, 1].set_ylabel('Distance')
         axes[0, 1].grid(True, alpha=0.3)
 
         # Critic Scores
@@ -1426,13 +1370,13 @@ class SpaceshipCWGANGP:
         axes[0, 2].grid(True, alpha=0.3)
 
         # Gradient Penalty
-        axes[1, 0].plot(epochs, gp_values, linewidth=2, marker='o')
+        axes[1, 0].plot(epochs, gp_values, 'purple', linewidth=2, marker='o')
         axes[1, 0].set_title('Gradient Penalty')
         axes[1, 0].set_xlabel('Epoch')
         axes[1, 0].set_ylabel('GP Value')
         axes[1, 0].grid(True, alpha=0.3)
 
-        # Generator Loss (Detailed)
+        # Generator Loss Zoomed
         axes[1, 1].plot(epochs, g_losses, 'b-', linewidth=2, marker='o')
         axes[1, 1].set_title('Generator Loss (Detailed)')
         axes[1, 1].set_xlabel('Epoch')
@@ -1441,18 +1385,336 @@ class SpaceshipCWGANGP:
 
         # Score Difference (Real - Fake)
         score_diff = np.array(real_scores) - np.array(fake_scores)
-        axes[1, 2].plot(epochs, score_diff, linewidth=2, marker='o')
+        axes[1, 2].plot(epochs, score_diff, 'orange', linewidth=2, marker='o')
         axes[1, 2].set_title('Score Difference (Real - Fake)')
         axes[1, 2].set_xlabel('Epoch')
         axes[1, 2].set_ylabel('Score Difference')
         axes[1, 2].grid(True, alpha=0.3)
 
         plt.tight_layout()
-
+        
         # Save plot
-        plot_path = Path(self.config.plots_dir) / f"wgan_gp_{kind}_metrics.png"
+        plot_path = Path(self.config.plots_dir) / f"cwgan_gp_{kind}_metrics.png"
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"Plot saved: {plot_path}")
-
+        print(f"📊 Plot saved: {plot_path}")
+        
         plt.show()
         plt.close()
+
+    def generate_class_specific_images(self, epoch: int, samples_per_class: int = 8):
+        """Generate images for each class separately for better visualization."""
+        try:
+            self.generator.eval()
+            
+            for class_id in range(self.num_classes):
+                with torch.no_grad():
+                    z = self._sample_noise(samples_per_class)
+                    labels = torch.full((samples_per_class,), class_id, device=self.device)
+                    fake_imgs = self.generator(z, labels).cpu()
+                    
+                    # Normalize to [0, 1]
+                    fake_imgs = (fake_imgs + 1) / 2.0
+                    fake_imgs = torch.clamp(fake_imgs, 0, 1)
+                
+                # Create grid and save
+                img_grid = torchvision.utils.make_grid(fake_imgs, nrow=min(4, samples_per_class))
+                save_path = Path(self.config.gen_out_dir) / f'class_{class_id}_samples_epoch_{epoch}.png'
+                torchvision.utils.save_image(img_grid, save_path)
+            
+            self.generator.train()
+            print(f"🎨 Class-specific images generated for epoch {epoch}")
+            
+        except Exception as e:
+            print(f"❌ Error generating class-specific images: {e}")
+
+    def fit(self):
+        """
+        Main training loop with validation, early stopping, and comprehensive logging.
+        Adapted for conditional GAN training.
+        
+        Returns:
+            Dict: Training history with metrics for each epoch
+        """
+        print("🚀 Starting Conditional WGAN-GP training...")
+        
+        # Initialize W&B
+        if self.config.use_wandb and self.config.wandb_project:
+            try:
+                wandb.init(
+                    project=self.config.wandb_project,
+                    config={
+                        'num_epochs': self.config.num_epochs,
+                        'batch_size': self.config.batch_size,
+                        'g_lr': self.config.g_lr,
+                        'c_lr': self.config.c_lr,
+                        'lambda_gp': self.config.lambda_gp,
+                        'n_critic': self.config.n_critic,
+                        'latent_dim': self.config.latent_dim,
+                        'num_classes': self.num_classes,
+                        'mixed_precision': self.config.mixed_precision,
+                        'patience': self.config.patience,
+                        'use_real_labels_for_fake': self.config.use_real_labels_for_fake,
+                    },
+                    reinit=True
+                )
+                print("📊 W&B initialized successfully")
+            except Exception as e:
+                print(f"⚠️  W&B initialization failed: {e}")
+                self.config.use_wandb = False
+
+        start_time = time.time()
+        
+        try:
+            for epoch in range(self.config.num_epochs):
+                self.current_epoch = epoch
+                epoch_start = time.time()
+                
+                print("-" * 100)
+                print(f"\t\t\t\tCONDITIONAL EPOCH {epoch}\t\t\t\t")
+                print("-" * 100)
+
+                # Training
+                train_metrics = self.train_epoch()
+
+                # Validation
+                val_metrics = {}
+                if epoch % self.config.validate_per_epoch == 0:
+                    val_metrics = self.validate_epoch()
+
+                # Update history
+                self.history[f"epoch_{epoch}"] = {
+                    "training": train_metrics,
+                    "validating": val_metrics
+                }
+
+                # Logging
+                epoch_time = time.time() - epoch_start
+                g_lr = self.g_optimizer.param_groups[0]['lr']
+                c_lr = self.c_optimizer.param_groups[0]['lr']
+                
+                print(f"⏱️  Epoch time: {epoch_time:.2f}s | G_LR: {g_lr:.2e} | C_LR: {c_lr:.2e}")
+                print(f"🔥 Train - G Loss: {train_metrics.get('g_loss_mean', 0):.4f} | "
+                      f"C Loss: {train_metrics.get('c_loss_mean', 0):.4f} | "
+                      f"W-Dist: {train_metrics.get('wasserstein_distance', 0):.4f}")
+                
+                if val_metrics:
+                    print(f"✅ Val   - G Loss: {val_metrics.get('g_loss_mean', 0):.4f} | "
+                          f"C Loss: {val_metrics.get('c_loss_mean', 0):.4f} | "
+                          f"W-Dist: {val_metrics.get('wasserstein_distance', 0):.4f}")
+
+                # Early stopping and model saving
+                if val_metrics:
+                    val_g_loss = val_metrics.get('g_loss_mean', float('inf'))
+                    improved = val_g_loss < self.best_g_val_loss - self.config.min_delta
+                    
+                    if improved:
+                        self.best_g_val_loss = val_g_loss
+                        self.patience_counter = 0
+                        print("-" * 100)
+                        print("<--- Validation improved! Best conditional model saved! --->")
+                        print("-" * 100)
+                        
+                        if self.config.save_best_only:
+                            self.save_checkpoint(epoch, is_best=True)
+                        
+                        # Save individual model weights for backward compatibility
+                        gen_name = f"{self.config.gen_save_name}_epoch_{epoch}_best.pth"
+                        critic_name = f"{self.config.critic_save_name}_epoch_{epoch}_best.pth"
+                        self.save_weights(self.config.model_dir, gen_name, critic_name)
+                    else:
+                        self.patience_counter += 1
+                        print(f"⏳ No improvement. Patience: {self.patience_counter}/{self.config.patience}")
+                        
+                        if self.patience_counter >= self.config.patience:
+                            print("🛑 Early stopping triggered due to no progress.")
+                            break
+
+                # Save last checkpoint
+                if self.config.save_last:
+                    self.save_checkpoint(epoch)
+
+                # Generate and save images
+                if self.config.save_images_every_epoch:
+                    self.generate_images(epoch)
+                    
+                    # Generate class-specific images periodically
+                    if epoch % 5 == 0:  # Every 5 epochs
+                        self.generate_class_specific_images(epoch)
+
+                # Update schedulers
+                if self.g_scheduler:
+                    if isinstance(self.g_scheduler, ReduceLROnPlateau):
+                        if val_metrics:
+                            self.g_scheduler.step(val_metrics.get('g_loss_mean', 0))
+                    else:
+                        self.g_scheduler.step()
+                        
+                if self.c_scheduler:
+                    if isinstance(self.c_scheduler, ReduceLROnPlateau):
+                        if val_metrics:
+                            self.c_scheduler.step(val_metrics.get('c_loss_mean', 0))
+                    else:
+                        self.c_scheduler.step()
+
+                # W&B logging
+                if self.config.use_wandb:
+                    log_dict = {
+                        'epoch': epoch,
+                        'g_lr': g_lr,
+                        'c_lr': c_lr,
+                        'epoch_time': epoch_time,
+                        'num_classes': self.num_classes,
+                        'train_g_loss': train_metrics.get('g_loss_mean', 0),
+                        'train_c_loss': train_metrics.get('c_loss_mean', 0),
+                        'train_wasserstein_dist': train_metrics.get('wasserstein_distance', 0),
+                        'train_fake_score': train_metrics.get('fake_score_mean', 0),
+                        'train_real_score': train_metrics.get('real_score_mean', 0),
+                        'train_gp': train_metrics.get('gp_mean', 0),
+                    }
+                    
+                    if val_metrics:
+                        log_dict.update({
+                            'val_g_loss': val_metrics.get('g_loss_mean', 0),
+                            'val_c_loss': val_metrics.get('c_loss_mean', 0),
+                            'val_wasserstein_dist': val_metrics.get('wasserstein_distance', 0),
+                            'val_fake_score': val_metrics.get('fake_score_mean', 0),
+                            'val_real_score': val_metrics.get('real_score_mean', 0),
+                        })
+                    
+                    # Log generated images to W&B
+                    if self.config.save_images_every_epoch:
+                        try:
+                            img_path = Path(self.config.gen_out_dir) / f'generated_epoch_{epoch}.png'
+                            if img_path.exists():
+                                log_dict['generated_images'] = wandb.Image(str(img_path))
+                                
+                            # Log class-specific images if available
+                            for class_id in range(min(self.num_classes, 5)):  # Log first 5 classes
+                                class_path = Path(self.config.gen_out_dir) / f'class_{class_id}_epoch_{epoch}.png'
+                                if class_path.exists():
+                                    log_dict[f'class_{class_id}_images'] = wandb.Image(str(class_path))
+                        except Exception as e:
+                            print(f"⚠️  Could not log images to W&B: {e}")
+                    
+                    wandb.log(log_dict)
+
+        except KeyboardInterrupt:
+            print("\n⚠️  Training interrupted by user")
+        except Exception as e:
+            print(f"\n❌ Training failed: {e}")
+            raise
+        finally:
+            total_time = time.time() - start_time
+            print(f"\n🏁 Conditional training completed in {total_time/60:.2f} minutes")
+            
+            if self.config.use_wandb:
+                try:
+                    wandb.finish()
+                except:
+                    pass
+
+        # Generate final plots
+        self.plot_losses(self.history, "training")
+        if any('validating' in hist and hist['validating'] for hist in self.history.values()):
+            self.plot_losses(self.history, "validating")
+
+        return self.history
+
+    def test(self):
+        """Run test evaluation with detailed metrics for conditional model."""
+        print("🧪 Running conditional test evaluation...")
+        
+        # Use validation set as test set (common in GAN evaluation)
+        test_metrics = self.validate_epoch()
+        
+        if test_metrics:
+            print(f"\n📊 CONDITIONAL TEST RESULTS:")
+            print(f"Generator Loss: {test_metrics['g_loss_mean']:.4f}")
+            print(f"Critic Loss: {test_metrics['c_loss_mean']:.4f}")
+            print(f"Wasserstein Distance: {test_metrics['wasserstein_distance']:.4f}")
+            print(f"Fake Score: {test_metrics['fake_score_mean']:.4f}")
+            print(f"Real Score: {test_metrics['real_score_mean']:.4f}")
+            print(f"Number of Classes: {self.num_classes}")
+            
+            # Generate test images for all classes
+            print("🖼️  Generating test images...")
+            self.generate_images("test")
+            self.generate_class_specific_images("test", samples_per_class=16)
+            
+        return test_metrics
+
+    def interpolate_between_classes(self, class_a: int, class_b: int, steps: int = 10, epoch: int = None):
+        """Generate interpolation between two classes in latent space."""
+        try:
+            self.generator.eval()
+            
+            with torch.no_grad():
+                # Fixed noise vector
+                z = self._sample_noise(1).repeat(steps, 1, *([1] * len(self.config.noise_dim)))
+                
+                # Interpolation between class embeddings
+                alpha_values = torch.linspace(0, 1, steps).unsqueeze(1).to(self.device)
+                
+                # Create interpolated "labels" - this is conceptual since embeddings are learned
+                # We'll generate samples transitioning from class_a to class_b
+                interpolated_imgs = []
+                
+                for i, alpha in enumerate(alpha_values):
+                    # For simplicity, we'll use discrete labels and let the model handle interpolation
+                    if alpha < 0.5:
+                        label = torch.tensor([class_a], device=self.device)
+                    else:
+                        label = torch.tensor([class_b], device=self.device)
+                    
+                    # You could implement more sophisticated interpolation in embedding space
+                    fake_img = self.generator(z[i:i+1], label)
+                    interpolated_imgs.append(fake_img)
+                
+                interpolated_imgs = torch.cat(interpolated_imgs, dim=0).cpu()
+                # Normalize to [0, 1]
+                interpolated_imgs = (interpolated_imgs + 1) / 2.0
+                interpolated_imgs = torch.clamp(interpolated_imgs, 0, 1)
+            
+            # Create grid and save
+            img_grid = torchvision.utils.make_grid(interpolated_imgs, nrow=steps)
+            epoch_str = f"_epoch_{epoch}" if epoch is not None else ""
+            save_path = Path(self.config.gen_out_dir) / f'interpolation_class_{class_a}_to_{class_b}{epoch_str}.png'
+            torchvision.utils.save_image(img_grid, save_path)
+            
+            self.generator.train()
+            print(f"🌈 Interpolation saved: {save_path}")
+            
+        except Exception as e:
+            print(f"❌ Error generating interpolation: {e}")
+
+    def generate_label_conditioned_samples(self, labels: List[int], num_samples_per_label: int = 4):
+        """Generate specific samples for given labels."""
+        try:
+            self.generator.eval()
+            all_imgs = []
+            
+            with torch.no_grad():
+                for label in labels:
+                    z = self._sample_noise(num_samples_per_label)
+                    label_tensor = torch.full((num_samples_per_label,), label, device=self.device)
+                    fake_imgs = self.generator(z, label_tensor)
+                    all_imgs.append(fake_imgs)
+                
+                all_imgs = torch.cat(all_imgs, dim=0).cpu()
+                # Normalize to [0, 1]
+                all_imgs = (all_imgs + 1) / 2.0
+                all_imgs = torch.clamp(all_imgs, 0, 1)
+            
+            # Create grid and save
+            img_grid = torchvision.utils.make_grid(all_imgs, nrow=num_samples_per_label)
+            save_path = Path(self.config.gen_out_dir) / f'conditioned_samples_{"_".join(map(str, labels))}.png'
+            torchvision.utils.save_image(img_grid, save_path)
+            
+            self.generator.train()
+            print(f"🎯 Label-conditioned samples saved: {save_path}")
+            return all_imgs
+            
+        except Exception as e:
+            print(f"❌ Error generating label-conditioned samples: {e}")
+            return None
+        
